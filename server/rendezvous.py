@@ -34,6 +34,7 @@ TOKEN_EXPIRY_SECONDS = 60
 class PeerInfo:
     peer_id: str
     mapped_addr: Optional[Tuple[str, int]] = None
+    local_addr: Optional[Tuple[str, int]] = None  # Private IP for hairpin NAT
     nat_type: Optional[str] = None
     websocket: Optional[WebSocketServerProtocol] = None
     waiting_for: Optional[str] = None  # peer_id this peer wants to connect to
@@ -185,11 +186,13 @@ class RendezvousServer:
                 if msg_type == 'register':
                     peer_id = data['peer_id']
                     mapped_addr = tuple(data['mapped_addr']) if data.get('mapped_addr') else None
+                    local_addr = tuple(data['local_addr']) if data.get('local_addr') else None
                     nat_type = data.get('nat_type')
                     
                     self.peers[peer_id] = PeerInfo(
                         peer_id=peer_id,
                         mapped_addr=mapped_addr,
+                        local_addr=local_addr,
                         nat_type=nat_type,
                         websocket=websocket
                     )
@@ -199,7 +202,7 @@ class RendezvousServer:
                         'peer_id': peer_id,
                         'server_stun_ports': [self.stun_port_1, self.stun_port_2]
                     }))
-                    logger.info(f"Peer {peer_id} registered, NAT type: {nat_type}, mapped: {mapped_addr}")
+                    logger.info(f"Peer {peer_id} registered, NAT type: {nat_type}, mapped: {mapped_addr}, local: {local_addr}")
                 
                 elif msg_type == 'request_token':
                     # Peer A requests token to connect to Peer B
@@ -248,6 +251,7 @@ class RendezvousServer:
                             'type': 'peer_info',
                             'peer_id': peer_b_id,
                             'mapped_addr': list(peer_b.mapped_addr),
+                            'local_addr': list(peer_b.local_addr) if peer_b.local_addr else list(peer_b.mapped_addr),
                             'nat_type': peer_b.nat_type
                         }))
                         
@@ -256,6 +260,7 @@ class RendezvousServer:
                                 'type': 'peer_info',
                                 'peer_id': peer_a_id,
                                 'mapped_addr': list(peer_a.mapped_addr),
+                                'local_addr': list(peer_a.local_addr) if peer_a.local_addr else list(peer_a.mapped_addr),
                                 'nat_type': peer_a.nat_type,
                                 'token': token  # B needs token to verify A
                             }))

@@ -85,6 +85,18 @@ class PeerNode:
         self.on_file_received = None
         self.on_connected = None
     
+    def _get_local_ip(self) -> str:
+        """Get the local/private IP address"""
+        try:
+            # Create a socket to determine local IP
+            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            s.connect((self.server_host, 80))
+            local_ip = s.getsockname()[0]
+            s.close()
+            return local_ip
+        except Exception:
+            return '127.0.0.1'
+    
     async def start(self):
         """Start the peer node"""
         logger.info(f"Starting peer node: {self.peer_id}")
@@ -114,11 +126,15 @@ class PeerNode:
         ws_url = f"ws://{self.server_host}:{self.server_ws_port}"
         self.websocket = await websockets.connect(ws_url)
         
-        # Register with server
+        # Get local IP address
+        local_ip = self._get_local_ip()
+        
+        # Register with server (include both public and private addresses)
         await self.websocket.send(json.dumps({
             'type': 'register',
             'peer_id': self.peer_id,
             'mapped_addr': list(self.nat_result.mapped_addr_1) if self.nat_result else None,
+            'local_addr': [local_ip, self.local_port],  # Private IP for hairpin NAT
             'nat_type': self.nat_result.nat_type if self.nat_result else 'unknown'
         }))
         
@@ -190,9 +206,22 @@ class PeerNode:
             return False
         
         peer_addr = tuple(peer_info['mapped_addr'])
+        peer_local_addr = tuple(peer_info.get('local_addr', peer_addr))  # Get private IP
         peer_nat_type = peer_info.get('nat_type', 'unknown')
         
-        logger.info(f"Peer {target_peer_id} address: {peer_addr}, NAT: {peer_nat_type}")
+        # Detect hairpin NAT (same public IP)
+        my_public_ip = self.nat_result.mapped_addr_1[0] if self.nat_result else None
+        peer_public_ip = peer_addr[0]
+        use_local_addr = (my_public_ip == peer_public_ip and peer_local_addr != peer_addr)
+        
+        if use_local_addr:
+            logger.info(f"Detected hairpin NAT (same public IP: {my_public_ip})")
+            logger.info(f"Using local address: {peer_local_addr} instead of {peer_addr}")
+            actual_addr = peer_local_addr
+        else:
+            actual_addr = peer_addr
+        
+        logger.info(f"Peer {target_peer_id} address: {actual_addr}, NAT: {peer_nat_type}")
         
         # Determine if hole punching is likely to work
         my_nat = self.nat_result.nat_type if self.nat_result else 'unknown'
@@ -200,7 +229,7 @@ class PeerNode:
         
         # Attempt hole punching
         if not both_symmetric:
-            punch_result = await self._attempt_hole_punch(target_peer_id, peer_addr, peer_nat_type)
+            punch_result = await self._attempt_hole_punch(target_peer_id, actual_addr, peer_nat_type)
             
             if punch_result.success:
                 self.metrics.record_hole_punch(
@@ -210,7 +239,7 @@ class PeerNode:
                 )
                 
                 # Establish QUIC over the punched hole
-                return await self._establish_quic(target_peer_id, peer_addr)
+                return await self._establish_quic(target_peer_id, actual_addr)
         else:
             logger.warning("Both peers have symmetric NAT, skipping hole punch")
         
@@ -341,16 +370,29 @@ class PeerNode:
                 # Incoming connection request
                 peer_id = data['peer_id']
                 peer_addr = tuple(data['mapped_addr'])
+                peer_local_addr = tuple(data.get('local_addr', peer_addr))
                 token = data.get('token')
                 
-                logger.info(f"Incoming connection from {peer_id} at {peer_addr}")
+                # Detect hairpin NAT
+                my_public_ip = self.nat_result.mapped_addr_1[0] if self.nat_result else None
+                peer_public_ip = peer_addr[0]
+                use_local_addr = (my_public_ip == peer_public_ip and peer_local_addr != peer_addr)
+                
+                if use_local_addr:
+                    logger.info(f"Detected hairpin NAT (same public IP: {my_public_ip})")
+                    logger.info(f"Using local address: {peer_local_addr} instead of {peer_addr}")
+                    actual_addr = peer_local_addr
+                else:
+                    actual_addr = peer_addr
+                
+                logger.info(f"Incoming connection from {peer_id} at {actual_addr}")
                 
                 # Start metrics
                 self.metrics.start_connection(peer_id)
                 
                 # Attempt hole punch (peer will punch simultaneously)
                 punch_result = await self._attempt_hole_punch(
-                    peer_id, peer_addr,
+                    peer_id, actual_addr,
                     data.get('nat_type', 'unknown')
                 )
                 
