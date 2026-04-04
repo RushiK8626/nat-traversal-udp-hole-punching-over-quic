@@ -94,13 +94,13 @@ Server listens on:
 ### 3. Start Peer A (Listener)
 
 ```bash
-python peer/main.py --server localhost --peer-id alice
+python peer/main.py --server <server_ip> --peer-id alice
 ```
 
 ### 4. Start Peer B (Connector)
 
 ```bash
-python peer/main.py --server localhost --peer-id bob --connect alice
+python peer/main.py --server <server_ip> --peer-id bob --connect alice
 ```
 
 ## Usage

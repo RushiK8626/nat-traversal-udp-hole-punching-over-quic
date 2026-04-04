@@ -1,8 +1,9 @@
-*.md
-!README.md
-/certs
 __pycache__/
 *.py[cod]
 *$py.class
+/certs
+/.vscode
+*.md
+!README.md
 metrics.json
 demo*
