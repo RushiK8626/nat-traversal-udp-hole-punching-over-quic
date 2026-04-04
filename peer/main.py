@@ -86,16 +86,32 @@ class PeerNode:
         self.on_connected = None
     
     def _get_local_ip(self) -> str:
-        """Get the local/private IP address"""
+        """Get the local/private IP address (LAN IP, not public)"""
+        import psutil
+        
         try:
-            # Create a socket to determine local IP
+            # Get all network interfaces and their addresses
+            for interface, addrs in psutil.net_if_addrs().items():
+                for addr in addrs:
+                    # Only check IPv4 addresses
+                    if addr.family == socket.AF_INET:
+                        ip = addr.address
+                        if ip and not ip.startswith('127.') and ip != '0.0.0.0':
+                            # Prefer private IPs (10.x, 172.16-31.x, 192.168.x)
+                            if (ip.startswith('10.') or 
+                                ip.startswith('192.168.') or
+                                (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
+                                return ip
+            
+            # Fallback: use socket method (may return public IP if no private IP)
             s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect((self.server_host, 80))
+            s.connect(('8.8.8.8', 80))  # Google DNS
             local_ip = s.getsockname()[0]
             s.close()
             return local_ip
-        except Exception:
-            return '127.0.0.1'
+        except Exception as e:
+            logger.warning(f"Could not determine local IP: {e}")
+            return None
     
     async def start(self):
         """Start the peer node"""
