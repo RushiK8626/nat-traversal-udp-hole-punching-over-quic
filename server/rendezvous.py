@@ -246,13 +246,17 @@ class RendezvousServer:
                     
                     # Exchange mapped addresses
                     if peer_a and peer_a.mapped_addr and peer_b.mapped_addr:
-                        # Notify both peers to start hole punching
+                        # Calculate a synchronized start time (now + 500ms to allow message propagation)
+                        punch_start_time = time.time() + 0.5
+                        
+                        # Notify both peers to start hole punching at the same time
                         await websocket.send(json.dumps({
                             'type': 'peer_info',
                             'peer_id': peer_b_id,
                             'mapped_addr': list(peer_b.mapped_addr),
                             'local_addr': list(peer_b.local_addr) if peer_b.local_addr else list(peer_b.mapped_addr),
-                            'nat_type': peer_b.nat_type
+                            'nat_type': peer_b.nat_type,
+                            'punch_start_time': punch_start_time
                         }))
                         
                         if peer_b.websocket:
@@ -262,10 +266,11 @@ class RendezvousServer:
                                 'mapped_addr': list(peer_a.mapped_addr),
                                 'local_addr': list(peer_a.local_addr) if peer_a.local_addr else list(peer_a.mapped_addr),
                                 'nat_type': peer_a.nat_type,
-                                'token': token  # B needs token to verify A
+                                'token': token,  # B needs token to verify A
+                                'punch_start_time': punch_start_time
                             }))
                         
-                        logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}")
+                        logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}, punch starts at {punch_start_time}")
                     else:
                         await websocket.send(json.dumps({
                             'type': 'connect_failed',

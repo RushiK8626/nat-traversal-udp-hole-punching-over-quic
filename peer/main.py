@@ -239,6 +239,14 @@ class PeerNode:
         
         logger.info(f"Peer {target_peer_id} address: {actual_addr}, NAT: {peer_nat_type}")
         
+        # Wait for synchronized punch start time if provided
+        punch_start_time = peer_info.get('punch_start_time')
+        if punch_start_time:
+            wait_time = punch_start_time - time.time()
+            if wait_time > 0:
+                logger.info(f"Waiting {wait_time:.2f}s for synchronized hole punch start...")
+                await asyncio.sleep(wait_time)
+        
         # Determine if hole punching is likely to work
         my_nat = self.nat_result.nat_type if self.nat_result else 'unknown'
         both_symmetric = my_nat == 'symmetric' and peer_nat_type == 'symmetric'
@@ -405,6 +413,14 @@ class PeerNode:
                 
                 # Start metrics
                 self.metrics.start_connection(peer_id)
+                
+                # Wait for synchronized punch start time if provided
+                punch_start_time = data.get('punch_start_time')
+                if punch_start_time:
+                    wait_time = punch_start_time - time.time()
+                    if wait_time > 0:
+                        logger.info(f"Waiting {wait_time:.2f}s for synchronized hole punch start...")
+                        await asyncio.sleep(wait_time)
                 
                 # Attempt hole punch (peer will punch simultaneously)
                 punch_result = await self._attempt_hole_punch(

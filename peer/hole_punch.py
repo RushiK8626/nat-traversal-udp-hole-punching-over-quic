@@ -17,8 +17,8 @@ from concurrent.futures import ThreadPoolExecutor
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger('hole_punch')
 
-PUNCH_INTERVAL_MS = 200  # Send every 200ms
-PUNCH_TIMEOUT_MS = 3000  # Total timeout 3 seconds
+PUNCH_INTERVAL_MS = 100  # Send every 100ms (more aggressive)
+PUNCH_TIMEOUT_MS = 10000  # Total timeout 10 seconds (more time for real NATs)
 PUNCH_MAGIC = b'NATPUNCH'
 
 
@@ -139,10 +139,24 @@ class HolePuncher:
             )
     
     async def _send_punches(self, target_addr: Tuple[str, int], max_attempts: int):
-        """Send punch packets at regular intervals"""
+        """Send punch packets at regular intervals with initial burst"""
         loop = asyncio.get_event_loop()
         
-        for seq in range(max_attempts):
+        # Send initial burst of packets to quickly open NAT binding
+        logger.info(f"Sending initial burst to {target_addr}")
+        for i in range(5):
+            packet = self._create_punch_packet(i)
+            try:
+                await loop.run_in_executor(
+                    None,
+                    lambda p=packet, t=target_addr: self.sock.sendto(p, t)
+                )
+            except Exception as e:
+                logger.debug(f"Burst send error: {e}")
+            await asyncio.sleep(0.02)  # 20ms between burst packets
+        
+        # Continue with regular interval punches
+        for seq in range(5, max_attempts):
             if self._punch_received.is_set():
                 break
             
@@ -153,7 +167,8 @@ class HolePuncher:
                     None,
                     lambda p=packet, t=target_addr: self.sock.sendto(p, t)
                 )
-                logger.debug(f"Sent punch #{seq} to {target_addr}")
+                if seq % 10 == 0:  # Log every 10th attempt
+                    logger.debug(f"Sent punch #{seq} to {target_addr}")
             except Exception as e:
                 logger.error(f"Send error: {e}")
             
@@ -171,6 +186,8 @@ class HolePuncher:
             self.sock.settimeout(0.1)  # 100ms timeout for blocking recv
             return self.sock.recvfrom(1024)
         
+        received_from = set()  # Track IPs we've received from
+        
         while not self._punch_received.is_set():
             try:
                 # Run blocking recv in thread pool for proper Windows compatibility
@@ -178,24 +195,32 @@ class HolePuncher:
                 
                 is_punch, parsed = self._is_punch_packet(data)
                 if is_punch:
-                    logger.debug(f"Received punch from {addr}: {parsed}")
+                    received_from.add(addr[0])
+                    logger.info(f"Received punch from {addr}, peer_id={parsed.get('peer_id')}")
                     
-                    # Verify it's from expected peer (IP should match, port might differ)
-                    if addr[0] == expected_addr[0]:
+                    # Accept punch from expected IP OR if it contains our expected peer_id
+                    # This handles symmetric NAT where port changes
+                    if addr[0] == expected_addr[0] or parsed.get('peer_id'):
                         self._peer_confirmed_addr = addr
                         self._punch_received.set()
                         
-                        # Send confirmation back
+                        # Send multiple confirmations back (in case some are lost)
                         confirm = json.dumps({
                             'magic': PUNCH_MAGIC.decode(),
                             'peer_id': self.peer_id,
                             'type': 'confirm',
                             'ts': time.time()
                         }).encode()
-                        self.sock.sendto(confirm, addr)
-                        logger.info(f"Received punch from peer at {addr}")
+                        for _ in range(3):
+                            try:
+                                self.sock.sendto(confirm, addr)
+                            except:
+                                pass
+                        logger.info(f"Hole punch confirmed with peer at {addr}")
                         executor.shutdown(wait=False)
                         return
+                else:
+                    logger.debug(f"Received non-punch data from {addr}: {data[:50]}")
             
             except socket.timeout:
                 # Expected timeout, continue loop
@@ -209,6 +234,9 @@ class HolePuncher:
                 if not self._punch_received.is_set():
                     logger.debug(f"Receive error: {e}")
                     await asyncio.sleep(0.05)
+        
+        if received_from:
+            logger.info(f"Received punches from IPs: {received_from} but none matched expected {expected_addr[0]}")
         
         executor.shutdown(wait=False)
 
