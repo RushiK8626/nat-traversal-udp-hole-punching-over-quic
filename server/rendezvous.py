@@ -254,8 +254,20 @@ class RendezvousServer:
                     peer_a = self.peers.get(peer_a_id)
                     peer_b = self.peers[peer_b_id]
                     
-                    # Exchange mapped addresses
-                    if peer_a and peer_a.mapped_addr and peer_b.mapped_addr:
+                    # Get peer addresses with fallback to local_addr
+                    peer_a_addr = peer_a.mapped_addr if peer_a and peer_a.mapped_addr else (peer_a.local_addr if peer_a else None)
+                    peer_b_addr = peer_b.mapped_addr if peer_b and peer_b.mapped_addr else (peer_b.local_addr if peer_b else None)
+                    
+                    if not peer_a_addr or not peer_b_addr:
+                        logger.warning(f"Connect {peer_a_id} -> {peer_b_id}: Missing addresses: A={peer_a_addr}, B={peer_b_addr}")
+                        await websocket.send(json.dumps({
+                            'type': 'connect_failed',
+                            'reason': f'Missing addresses: A has {peer_a_addr}, B has {peer_b_addr}'
+                        }))
+                        continue
+                    
+                    # Exchange addresses (use mapped_addr if available, fallback to local_addr)
+                    if peer_a and peer_b:
                         # Calculate a synchronized start time (now + 500ms to allow message propagation)
                         punch_start_time = time.time() + 0.5
                         
@@ -263,7 +275,7 @@ class RendezvousServer:
                         await websocket.send(json.dumps({
                             'type': 'peer_info',
                             'peer_id': peer_b_id,
-                            'mapped_addr': list(peer_b.mapped_addr),
+                            'mapped_addr': list(peer_b.mapped_addr) if peer_b.mapped_addr else list(peer_b.local_addr),
                             'local_addr': list(peer_b.local_addr) if peer_b.local_addr else list(peer_b.mapped_addr),
                             'nat_type': peer_b.nat_type,
                             'punch_start_time': punch_start_time
@@ -273,7 +285,7 @@ class RendezvousServer:
                             await peer_b.websocket.send(json.dumps({
                                 'type': 'peer_info',
                                 'peer_id': peer_a_id,
-                                'mapped_addr': list(peer_a.mapped_addr),
+                                'mapped_addr': list(peer_a.mapped_addr) if peer_a.mapped_addr else list(peer_a.local_addr),
                                 'local_addr': list(peer_a.local_addr) if peer_a.local_addr else list(peer_a.mapped_addr),
                                 'nat_type': peer_a.nat_type,
                                 'token': token,  # B needs token to verify A
@@ -281,11 +293,6 @@ class RendezvousServer:
                             }))
                         
                         logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}, punch starts at {punch_start_time}")
-                    else:
-                        await websocket.send(json.dumps({
-                            'type': 'connect_failed',
-                            'reason': 'Missing mapped addresses'
-                        }))
                 
                 elif msg_type == 'hole_punch_success':
                     # Peer reports successful hole punch
