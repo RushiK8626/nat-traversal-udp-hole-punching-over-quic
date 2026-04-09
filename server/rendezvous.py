@@ -98,23 +98,31 @@ class StunProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr: Tuple[str, int]):
         """Handle incoming STUN probe and echo back mapped address"""
         try:
-            request = json.loads(data.decode())
-            if request.get('type') == 'probe':
-                peer_id = request.get('peer_id', 'unknown')
-                response = {
-                    'type': 'probe_response',
-                    'port_id': self.port_id,
-                    'mapped_ip': addr[0],
-                    'mapped_port': addr[1],
-                    'server_port': STUN_PORT_1 if self.port_id == 1 else STUN_PORT_2
-                }
-                self.transport.sendto(json.dumps(response).encode(), addr)
-                logger.debug(f"Probe from {peer_id} @ {addr} on port {self.port_id}")
-                
-                # Store mapping for relay purposes
-                self.server.peer_mappings[peer_id] = addr
-        except Exception as e:
-            logger.error(f"Error handling probe: {e}")
+            text = data.decode('utf-8')
+        except UnicodeDecodeError:
+            logger.debug(f"Ignoring non-UTF8 UDP packet from {addr}")
+            return
+        
+        try:
+            request = json.loads(text)
+        except json.JSONDecodeError:
+            logger.debug(f"Ignoring non-JSON UDP packet from {addr}: {text[:80]}")
+            return
+        
+        if request.get('type') == 'probe':
+            peer_id = request.get('peer_id', 'unknown')
+            response = {
+                'type': 'probe_response',
+                'port_id': self.port_id,
+                'mapped_ip': addr[0],
+                'mapped_port': addr[1],
+                'server_port': STUN_PORT_1 if self.port_id == 1 else STUN_PORT_2
+            }
+            self.transport.sendto(json.dumps(response).encode(), addr)
+            logger.debug(f"Probe from {peer_id} @ {addr} on port {self.port_id}")
+            
+            # Store mapping for relay purposes
+            self.server.peer_mappings[peer_id] = addr
     
     def error_received(self, exc):
         logger.error(f"STUN socket error: {exc}")
@@ -235,10 +243,12 @@ class RendezvousServer:
                     
                     # Check if peer B is registered
                     if peer_b_id not in self.peers:
+                        online_peers = [p for p in self.peers.keys() if self.peers[p].websocket]
                         await websocket.send(json.dumps({
                             'type': 'connect_failed',
-                            'reason': 'Target peer not registered'
+                            'reason': f'Target peer not registered. Online peers: {online_peers}'
                         }))
+                        logger.debug(f"Connect request from {peer_a_id} to {peer_b_id} failed: peer not registered (online: {online_peers})")
                         continue
                     
                     peer_a = self.peers.get(peer_a_id)

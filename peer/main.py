@@ -551,11 +551,22 @@ async def interactive_mode(node: PeerNode, target_peer_id: str = None):
     node.on_connected = on_connected
     
     if target_peer_id:
-        # Initiator mode - connect to peer
-        success = await node.connect_to_peer(target_peer_id)
-        if not success:
-            print("Failed to connect")
-            return
+        # Initiator mode - connect to peer with retries
+        max_retries = 5
+        retry_delay = 2.0  # seconds
+        
+        for attempt in range(1, max_retries + 1):
+            print(f"Connecting to peer: {target_peer_id} (attempt {attempt}/{max_retries})...")
+            success = await node.connect_to_peer(target_peer_id)
+            if success:
+                break
+            
+            if attempt < max_retries:
+                print(f"Connection failed, retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+            else:
+                print("Failed to connect after all retries")
+                return
     else:
         # Listener mode - wait for connections
         print("Waiting for incoming connections...")
