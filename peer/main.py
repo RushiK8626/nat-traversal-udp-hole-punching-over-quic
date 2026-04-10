@@ -221,23 +221,31 @@ class PeerNode:
             logger.error(f"Unexpected response: {peer_info}")
             return False
         
-        peer_addr = tuple(peer_info['mapped_addr'])
-        peer_local_addr = tuple(peer_info.get('local_addr', peer_addr))  # Get private IP
+        peer_addr = tuple(peer_info['mapped_addr']) if peer_info.get('mapped_addr') else None
+        peer_local_addr = tuple(peer_info.get('local_addr')) if peer_info.get('local_addr') else None
         peer_nat_type = peer_info.get('nat_type', 'unknown')
-        
+
+        if not peer_addr:
+            logger.error(f"No mapped address from peer {target_peer_id}, cannot attempt direct connection")
+            logger.info("Falling back to relay mode")
+            return await self._establish_relay(target_peer_id)
+
         # Detect hairpin NAT (same public IP)
         my_public_ip = self.nat_result.mapped_addr_1[0] if self.nat_result else None
         peer_public_ip = peer_addr[0]
-        use_local_addr = (my_public_ip == peer_public_ip and peer_local_addr != peer_addr)
-        
+        use_local_addr = (my_public_ip == peer_public_ip and peer_local_addr)
+
         if use_local_addr:
             logger.info(f"Detected hairpin NAT (same public IP: {my_public_ip})")
             logger.info(f"Using local address: {peer_local_addr} instead of {peer_addr}")
             actual_addr = peer_local_addr
         else:
             actual_addr = peer_addr
-        
+
         logger.info(f"Peer {target_peer_id} address: {actual_addr}, NAT: {peer_nat_type}")
+        logger.info(f"  Mapped (public): {peer_addr}")
+        if peer_local_addr:
+            logger.info(f"  Local (private): {peer_local_addr}")
         
         # Wait for synchronized punch start time if provided
         punch_start_time = peer_info.get('punch_start_time')

@@ -177,33 +177,36 @@ class HolePuncher:
     async def _receive_punches(self, expected_addr: Tuple[str, int]):
         """Listen for incoming punch packets using thread pool for Windows compatibility"""
         loop = asyncio.get_event_loop()
-        
+
         executor = ThreadPoolExecutor(max_workers=1)
-        
+
         def blocking_recv():
             """Receive with timeout in a thread-safe way"""
             # Set timeout each time to ensure consistent behavior
             self.sock.settimeout(0.1)  # 100ms timeout for blocking recv
             return self.sock.recvfrom(1024)
-        
+
         received_from = set()  # Track IPs we've received from
-        
+        punch_count = 0
+
         while not self._punch_received.is_set():
             try:
                 # Run blocking recv in thread pool for proper Windows compatibility
                 data, addr = await loop.run_in_executor(executor, blocking_recv)
-                
+
                 is_punch, parsed = self._is_punch_packet(data)
                 if is_punch:
+                    punch_count += 1
                     received_from.add(addr[0])
-                    logger.info(f"Received punch from {addr}, peer_id={parsed.get('peer_id')}")
-                    
+                    if punch_count == 1 or punch_count % 5 == 0:  # Log first and every 5th punch
+                        logger.info(f"Received punch #{punch_count} from {addr}, peer_id={parsed.get('peer_id')}")
+
                     # Accept punch from expected IP OR if it contains our expected peer_id
                     # This handles symmetric NAT where port changes
                     if addr[0] == expected_addr[0] or parsed.get('peer_id'):
                         self._peer_confirmed_addr = addr
                         self._punch_received.set()
-                        
+
                         # Send multiple confirmations back (in case some are lost)
                         confirm = json.dumps({
                             'magic': PUNCH_MAGIC.decode(),
@@ -216,12 +219,12 @@ class HolePuncher:
                                 self.sock.sendto(confirm, addr)
                             except:
                                 pass
-                        logger.info(f"Hole punch confirmed with peer at {addr}")
+                        logger.info(f"Hole punch confirmed with peer at {addr} (received {punch_count} punches total)")
                         executor.shutdown(wait=False)
                         return
                 else:
                     logger.debug(f"Received non-punch data from {addr}: {data[:50]}")
-            
+
             except socket.timeout:
                 # Expected timeout, continue loop
                 continue
@@ -234,10 +237,12 @@ class HolePuncher:
                 if not self._punch_received.is_set():
                     logger.debug(f"Receive error: {e}")
                     await asyncio.sleep(0.05)
-        
+
         if received_from:
-            logger.info(f"Received punches from IPs: {received_from} but none matched expected {expected_addr[0]}")
-        
+            logger.warning(f"Received {punch_count} punches from IPs: {received_from} but none matched expected {expected_addr[0]} - possible symmetric NAT or firewall blocking")
+        else:
+            logger.warning(f"No punches received from any IP (expected {expected_addr[0]}) - firewall or network isolation likely")
+
         executor.shutdown(wait=False)
 
 

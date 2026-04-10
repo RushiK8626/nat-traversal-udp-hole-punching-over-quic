@@ -45,6 +45,7 @@ class NATClassifier:
         self.stun_port_2 = stun_port_2
         self.timeout = timeout
         self.retries = retries
+        self.extended_retries = retries + 3  # Additional retries for difficult network conditions
     
     async def probe_port(self, sock: socket.socket, peer_id: str, 
                          server_port: int) -> Optional[Tuple[str, int]]:
@@ -119,39 +120,57 @@ class NATClassifier:
     async def classify(self, peer_id: str, local_port: int = 0) -> Optional[NATClassificationResult]:
         """
         Classify NAT type by sending probes from same local port to different server ports.
-        
+
         Strategy:
         - Create one UDP socket bound to local_port (or random if 0)
         - Send probes to both STUN ports
         - Compare the mapped addresses returned
-        
+
         Classification:
         - Same IP + same port → full_cone or restricted_cone
         - Same IP + different ports → port_restricted
         - Different IPs or significantly different ports → symmetric
+
+        Note: If both probes fail, returns None (classification failed).
+        Client may proceed with 'unknown' NAT type and rely on relay fallback.
         """
         # Create UDP socket
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setblocking(False)
-        
+
         try:
             # Bind to local port (0 = random)
             sock.bind(('0.0.0.0', local_port))
             actual_local_port = sock.getsockname()[1]
             logger.info(f"Probing from local port {actual_local_port}")
-            
-            # Probe both STUN ports
+
+            # Try with standard retries first
             mapped_1 = await self.probe_port(sock, peer_id, self.stun_port_1)
             mapped_2 = await self.probe_port(sock, peer_id, self.stun_port_2)
-            
+
+            # If both failed, try with more attempts (WSL2, containers, etc.)
+            if not mapped_1 and not mapped_2:
+                logger.warning(f"Initial STUN probe failed, retrying with extended attempts ({self.extended_retries} retries)...")
+
+                # Recreate socket to clear any state
+                sock2 = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                sock2.setblocking(False)
+                sock2.bind(('0.0.0.0', local_port or 0))
+                actual_local_port = sock2.getsockname()[1]
+
+                # Extended probe with more patience
+                mapped_1 = await self._probe_port_extended(sock2, peer_id, self.stun_port_1)
+                mapped_2 = await self._probe_port_extended(sock2, peer_id, self.stun_port_2)
+                sock2.close()
+
             if not mapped_1 or not mapped_2:
-                logger.error("Failed to get responses from STUN server")
+                logger.error("Failed to get responses from STUN server (both standard and extended attempts)")
                 return None
-            
+
             # Classify based on mapped addresses
             same_ip = mapped_1[0] == mapped_2[0]
             same_port = mapped_1[1] == mapped_2[1]
-            
+
             if same_ip and same_port:
                 # Full cone or restricted cone (can't distinguish without more tests)
                 nat_type = 'full_cone'  # Assume best case
@@ -169,7 +188,7 @@ class NATClassifier:
                 # Different IPs - definitely symmetric or multi-NAT
                 nat_type = 'symmetric'
                 confidence = 'high'
-            
+
             result = NATClassificationResult(
                 nat_type=nat_type,
                 mapped_addr_1=mapped_1,
@@ -177,15 +196,58 @@ class NATClassifier:
                 local_port=actual_local_port,
                 confidence=confidence
             )
-            
+
             logger.info(f"NAT Classification: {nat_type} (confidence: {confidence})")
             logger.info(f"  Mapped addr 1: {mapped_1[0]}:{mapped_1[1]}")
             logger.info(f"  Mapped addr 2: {mapped_2[0]}:{mapped_2[1]}")
-            
+
             return result
-        
+
         finally:
             sock.close()
+
+    async def _probe_port_extended(self, sock: socket.socket, peer_id: str,
+                                   server_port: int, retries: int = None) -> Optional[Tuple[str, int]]:
+        """Extended probe with more retries for difficult network conditions"""
+        if retries is None:
+            retries = self.extended_retries
+
+        loop = asyncio.get_event_loop()
+        probe = json.dumps({
+            'type': 'probe',
+            'peer_id': peer_id
+        }).encode()
+
+        for attempt in range(retries):
+            try:
+                sock.setblocking(False)
+                sock.sendto(probe, (self.server_host, server_port))
+                logger.debug(f"Extended probe attempt {attempt + 1}/{retries} to {self.server_host}:{server_port}")
+
+                try:
+                    data = await asyncio.wait_for(
+                        self._recv_with_select(sock, 1024),
+                        timeout=self.timeout
+                    )
+                    response = json.loads(data.decode())
+
+                    if response.get('type') == 'probe_response':
+                        mapped_ip = response['mapped_ip']
+                        mapped_port = response['mapped_port']
+                        logger.debug(f"Extended probe to port {server_port}: mapped={mapped_ip}:{mapped_port}")
+                        return (mapped_ip, mapped_port)
+
+                except asyncio.TimeoutError:
+                    logger.debug(f"Extended probe timeout (attempt {attempt + 1}/{retries})")
+                    await asyncio.sleep(0.2)  # Slightly longer pause
+                    continue
+
+            except Exception as e:
+                logger.debug(f"Extended probe error: {e}")
+                await asyncio.sleep(0.2)
+                continue
+
+        return None
     
     async def classify_with_socket(self, peer_id: str, sock: socket.socket) -> Optional[NATClassificationResult]:
         """
@@ -194,19 +256,25 @@ class NATClassifier:
         """
         local_port = sock.getsockname()[1]
         logger.info(f"Classifying NAT using existing socket on port {local_port}")
-        
+
         # Probe both STUN ports
         mapped_1 = await self.probe_port(sock, peer_id, self.stun_port_1)
         mapped_2 = await self.probe_port(sock, peer_id, self.stun_port_2)
-        
+
+        # If both failed, use extended probes
+        if not mapped_1 and not mapped_2:
+            logger.warning(f"Initial STUN probe failed with existing socket, retrying with extended attempts...")
+            mapped_1 = await self._probe_port_extended(sock, peer_id, self.stun_port_1)
+            mapped_2 = await self._probe_port_extended(sock, peer_id, self.stun_port_2)
+
         if not mapped_1 or not mapped_2:
-            logger.error("Failed to get responses from STUN server")
+            logger.error("Failed to get responses from STUN server (all attempts failed)")
             return None
-        
+
         # Classify based on mapped addresses
         same_ip = mapped_1[0] == mapped_2[0]
         same_port = mapped_1[1] == mapped_2[1]
-        
+
         if same_ip and same_port:
             nat_type = 'full_cone'
             confidence = 'high'
@@ -221,7 +289,7 @@ class NATClassifier:
         else:
             nat_type = 'symmetric'
             confidence = 'high'
-        
+
         return NATClassificationResult(
             nat_type=nat_type,
             mapped_addr_1=mapped_1,

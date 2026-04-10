@@ -190,13 +190,24 @@ class RendezvousServer:
             async for message in websocket:
                 data = json.loads(message)
                 msg_type = data.get('type')
-                
+
                 if msg_type == 'register':
                     peer_id = data['peer_id']
                     mapped_addr = tuple(data['mapped_addr']) if data.get('mapped_addr') else None
                     local_addr = tuple(data['local_addr']) if data.get('local_addr') else None
                     nat_type = data.get('nat_type')
-                    
+
+                    # Extract peer's public IP from WebSocket connection if NAT classification failed
+                    if not mapped_addr:
+                        try:
+                            # Get client's IP from websocket connection
+                            client_ip = websocket.remote_address[0]
+                            # Use a default port (will be updated if client sends mapped_addr)
+                            mapped_addr = (client_ip, 3478)  # Placeholder port
+                            logger.info(f"No mapped_addr from peer {peer_id}, using websocket source IP: {client_ip}")
+                        except:
+                            logger.warning(f"Could not extract IP from websocket for {peer_id}")
+
                     self.peers[peer_id] = PeerInfo(
                         peer_id=peer_id,
                         mapped_addr=mapped_addr,
@@ -253,10 +264,11 @@ class RendezvousServer:
                     
                     peer_a = self.peers.get(peer_a_id)
                     peer_b = self.peers[peer_b_id]
-                    
-                    # Get peer addresses with fallback to local_addr
-                    peer_a_addr = peer_a.mapped_addr if peer_a and peer_a.mapped_addr else (peer_a.local_addr if peer_a else None)
-                    peer_b_addr = peer_b.mapped_addr if peer_b and peer_b.mapped_addr else (peer_b.local_addr if peer_b else None)
+
+                    # Always use mapped_addr (public) first, only use local_addr for hairpin NAT detection
+                    # Never send private IP (10.x, 172.16-31.x, 192.168.x) as primary target
+                    peer_a_addr = peer_a.mapped_addr if peer_a and peer_a.mapped_addr else None
+                    peer_b_addr = peer_b.mapped_addr if peer_b else None
                     
                     if not peer_a_addr or not peer_b_addr:
                         logger.warning(f"Connect {peer_a_id} -> {peer_b_id}: Missing addresses: A={peer_a_addr}, B={peer_b_addr}")
@@ -266,33 +278,36 @@ class RendezvousServer:
                         }))
                         continue
                     
-                    # Exchange addresses (use mapped_addr if available, fallback to local_addr)
+                    # Exchange addresses (always use mapped_addr for P2P attempts)
                     if peer_a and peer_b:
                         # Calculate a synchronized start time (now + 500ms to allow message propagation)
                         punch_start_time = time.time() + 0.5
-                        
+
                         # Notify both peers to start hole punching at the same time
+                        # Send mapped_addr as primary target, local_addr for hairpin NAT detection
                         await websocket.send(json.dumps({
                             'type': 'peer_info',
                             'peer_id': peer_b_id,
-                            'mapped_addr': list(peer_b.mapped_addr) if peer_b.mapped_addr else list(peer_b.local_addr),
-                            'local_addr': list(peer_b.local_addr) if peer_b.local_addr else list(peer_b.mapped_addr),
+                            'mapped_addr': list(peer_b.mapped_addr) if peer_b.mapped_addr else None,
+                            'local_addr': list(peer_b.local_addr) if peer_b.local_addr else None,
                             'nat_type': peer_b.nat_type,
                             'punch_start_time': punch_start_time
                         }))
-                        
+
                         if peer_b.websocket:
                             await peer_b.websocket.send(json.dumps({
                                 'type': 'peer_info',
                                 'peer_id': peer_a_id,
-                                'mapped_addr': list(peer_a.mapped_addr) if peer_a.mapped_addr else list(peer_a.local_addr),
-                                'local_addr': list(peer_a.local_addr) if peer_a.local_addr else list(peer_a.mapped_addr),
+                                'mapped_addr': list(peer_a.mapped_addr) if peer_a.mapped_addr else None,
+                                'local_addr': list(peer_a.local_addr) if peer_a.local_addr else None,
                                 'nat_type': peer_a.nat_type,
                                 'token': token,  # B needs token to verify A
                                 'punch_start_time': punch_start_time
                             }))
-                        
+
                         logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}, punch starts at {punch_start_time}")
+                        logger.info(f"  {peer_a_id} -> {peer_b}: {peer_b.mapped_addr}")
+                        logger.info(f"  {peer_b_id} -> {peer_a}: {peer_a.mapped_addr}")
                 
                 elif msg_type == 'hole_punch_success':
                     # Peer reports successful hole punch
