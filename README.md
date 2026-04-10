@@ -8,7 +8,7 @@ A complete NAT traversal implementation using UDP hole punching with QUIC transp
 - **UDP Hole Punching**: Simultaneous hole punching with retry logic
 - **QUIC Transport**: Using `aioquic` with 0-RTT session resumption
 - **Relay Fallback**: WebSocket-based relay when hole punching fails
-- **Token Authentication**: HMAC-SHA256 signed connection tokens with 60s expiry
+- **TLS Authentication**: QUIC built-in TLS 1.3 certificate-based authentication
 - **Metrics Dashboard**: Real-time metrics via HTTP endpoint
 
 ## Architecture
@@ -40,7 +40,7 @@ A complete NAT traversal implementation using UDP hole punching with QUIC transp
                    │                 │
                    │  - STUN Probes  │
                    │  - WS Signaling │
-                   │  - Token Auth   │
+                   │  - Peer Coord   │
                    │  - Relay Mode   │
                    └─────────────────┘
 ```
@@ -56,7 +56,7 @@ nat/
 │   ├── hole_punch.py      # UDP hole punching logic
 │   ├── quic_peer.py       # QUIC with aioquic + 0-RTT
 │   ├── relay.py           # WebSocket relay fallback
-│   ├── auth.py            # Token authentication
+│   ├── auth.py            # Legacy token auth module (not used in main flow)
 │   ├── metrics.py         # Metrics collection + HTTP endpoint
 │   └── main.py            # Main orchestrator
 ├── certs/                 # TLS certificates (generated)
@@ -71,6 +71,105 @@ nat/
 
 ```bash
 pip install -r requirements.txt
+```
+
+## Command Reference (Local + Docker)
+
+Use this section as a copy/paste checklist for setup and day-to-day usage.
+
+### Local setup (PowerShell)
+
+```powershell
+# from project root
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+python scripts/gen_certs.py
+```
+
+### Local setup (bash)
+
+```bash
+# from project root
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+python3 scripts/gen_certs.py
+```
+
+### Local run (3 terminals)
+
+Terminal 1 (server):
+
+```bash
+python server/rendezvous.py --host 0.0.0.0
+```
+
+Terminal 2 (alice listener):
+
+```bash
+python peer/main.py --server 127.0.0.1 --peer-id alice --metrics-port 9090
+```
+
+Terminal 3 (bob connector):
+
+```bash
+python peer/main.py --server 127.0.0.1 --peer-id bob --connect alice --metrics-port 9091
+```
+
+### Local usage commands (inside peer prompt)
+
+```text
+hello
+/stats
+/file ./somefile.txt
+/quit
+```
+
+### Local metrics commands
+
+```bash
+curl http://localhost:9090/metrics
+curl http://localhost:9091/metrics
+curl http://localhost:9090/metrics/summary
+```
+
+### Docker setup and run (PowerShell)
+
+```powershell
+# from project root
+New-Item -ItemType Directory -Force docker_data/bob_send | Out-Null
+New-Item -ItemType Directory -Force docker_data/alice_inbox | Out-Null
+Set-Content -Path docker_data/bob_send/test.txt -Value "hello from bob via quic file transfer"
+
+docker compose down --remove-orphans
+docker compose up -d --build rendezvous alice
+docker compose run --rm bob
+```
+
+Inside Bob prompt:
+
+```text
+/file /send/test.txt
+/stats
+```
+
+Verify on host:
+
+```powershell
+Get-ChildItem docker_data/alice_inbox
+Get-ChildItem docker_data/alice_inbox/alice
+Get-Content docker_data/alice_inbox/alice/test.txt
+```
+
+### Docker useful commands
+
+```powershell
+docker compose logs -f rendezvous
+docker compose logs -f alice
+docker compose logs --tail=120 alice
+docker compose ps
+docker compose down
 ```
 
 ## Quick Start
@@ -102,6 +201,80 @@ python peer/main.py --server <server_ip> --peer-id alice
 ```bash
 python peer/main.py --server <server_ip> --peer-id bob --connect alice
 ```
+
+## Docker Compose: Exact File Transfer Test
+
+This repository includes a Docker Compose setup that can be used to verify end-to-end file transfer.
+
+### What this setup mounts
+
+- `./docker_data/bob_send` -> `/send` inside Bob container (source files to send)
+- `./docker_data/alice_inbox` -> `/app/received_files` inside Alice container (received files)
+
+Received files are saved under:
+
+- `/app/received_files/<peer_id>/<filename>` inside container
+- `docker_data/alice_inbox/<peer_id>/<filename>` on host
+
+### 1. Prepare folders and test file (PowerShell)
+
+```powershell
+New-Item -ItemType Directory -Force docker_data/bob_send | Out-Null
+New-Item -ItemType Directory -Force docker_data/alice_inbox | Out-Null
+Set-Content -Path docker_data/bob_send/test.txt -Value "hello from bob via quic file transfer"
+```
+
+### 2. Start rendezvous + Alice
+
+```powershell
+docker compose down --remove-orphans
+docker compose up -d --build rendezvous alice
+```
+
+Optional log watch:
+
+```powershell
+docker compose logs -f alice
+```
+
+### 3. Start Bob interactively and send file
+
+```powershell
+docker compose run --rm bob
+```
+
+Then inside Bob's interactive prompt:
+
+```text
+/file /send/test.txt
+/stats
+```
+
+### 4. Verify file on host
+
+```powershell
+Get-ChildItem docker_data/alice_inbox
+Get-ChildItem docker_data/alice_inbox/alice
+Get-Content docker_data/alice_inbox/alice/test.txt
+```
+
+### 5. Stop services
+
+```powershell
+docker compose down
+```
+
+### Expected successful logs
+
+- Bob: `*** Connected to alice (direct mode) ***`
+- Bob: `File sent: test.txt (...)`
+- Alice: `File transfer complete: test.txt`
+- Alice: `*** File received: test.txt (...) -> received_files/alice/test.txt ***`
+
+### Important note about relay mode
+
+If logs show relay mode (`Connected ... (relay mode)`), `/file` is intentionally unavailable.
+File transfer works only in direct QUIC mode.
 
 ## Usage
 
@@ -181,19 +354,17 @@ When hole punching fails:
 3. 4KB payload limit (no file transfers)
 4. Metrics flag `using_relay: true`
 
-## Token Authentication
+## QUIC TLS Authentication
 
-Connection flow:
-1. Peer A requests token for Peer B from server
-2. Server returns `HMAC-SHA256(a_id + b_id + expiry, secret)` base64 encoded
-3. Peer A sends token with connect request
-4. Peer B verifies token before accepting
-
-Tokens expire in 60 seconds.
+Connection authentication flow:
+1. Peers exchange candidate addresses via rendezvous server signaling
+2. Peers establish QUIC directly over the punched UDP path
+3. QUIC performs built-in TLS 1.3 handshake with certificate verification
+4. Connection proceeds only if certificate validation succeeds
 
 ## Environment Variables
 
-- `NAT_SECRET_KEY` - HMAC secret for token signing (default provided for testing)
+No token-secret environment variable is required for peer authentication.
 
 ## Testing Locally
 
@@ -250,7 +421,7 @@ Runs comprehensive tests:
 - File structure validation
 - Dependency verification
 - NAT classifier testing
-- Token auth testing
+- QUIC TLS config testing
 - Metrics endpoint testing
 
 ### Interactive Demo
@@ -263,7 +434,7 @@ Step-by-step guided demo showing:
 - Server startup
 - Peer registration
 - NAT classification
-- Connection token exchange
+- QUIC TLS handshake
 - Hole punch attempt
 - Relay fallback
 - Message sending
@@ -278,12 +449,12 @@ python server/rendezvous.py --host 127.0.0.1
 
 **Terminal 2 - Start Alice (Listener):**
 ```bash
-python peer/main.py --server 127.0.0.1 --peer-id alice
+python peer/main.py --server 127.0.0.1 --peer-id alice --metrics-port 9090
 ```
 
 **Terminal 3 - Start Bob (Connector):**
 ```bash
-python peer/main.py --server 127.0.0.1 --peer-id bob --connect alice
+python peer/main.py --server 127.0.0.1 --peer-id bob --connect alice --metrics-port 9091
 ```
 
 **Check Metrics:**
@@ -420,6 +591,12 @@ Peer A                Server (Relay)              Peer B
 - Firewall blocking UDP ports
 - Check: UFW, iptables, Windows Firewall
 - Allow: UDP traffic on configured ports
+
+### "File transfer complete" in logs but file not found on host
+- Verify you rebuilt after latest changes: `docker compose up -d --build rendezvous alice`
+- Verify expected host path: `docker_data/alice_inbox/alice/<filename>`
+- Verify connection mode is direct, not relay
+- Check Alice logs: `docker compose logs --tail=120 alice`
 
 ## License
 

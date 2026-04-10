@@ -387,10 +387,11 @@ class QuicPeer:
             is_client=True,
             alpn_protocols=["nat-traversal"],
         )
-        # Load certificate for verification (self-signed)
+        # Use a stable name for SNI / certificate validation across hairpin/local IP flows.
+        config.server_name = "localhost"
+        # Trust the generated self-signed certificate and require verification.
         config.load_verify_locations(self.cert_file)
-        # Allow self-signed certs
-        config.verify_mode = ssl.CERT_NONE
+        config.verify_mode = ssl.CERT_REQUIRED
         
         # Enable 0-RTT
         config.session_ticket_handler = self.ticket_store.add
