@@ -1,0 +1,36 @@
+services:
+  rendezvous:
+    build: .
+    command: python server/rendezvous.py --host 0.0.0.0
+    ports:
+      - "3478:3478/udp"
+      - "3479:3479/udp"
+      - "8765:8765"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8765), 2); s.close()"]
+      interval: 2s
+      timeout: 2s
+      retries: 15
+
+  alice:
+    build: .
+    command: python peer/main.py --server rendezvous --peer-id alice
+    depends_on:
+      rendezvous:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./docker_data/alice_inbox:/app/received_files
+
+  bob:
+    build: .
+    command: python peer/main.py --server rendezvous --peer-id bob --connect alice
+    depends_on:
+      rendezvous:
+        condition: service_healthy
+    stdin_open: true
+    tty: true
+    volumes:
+      - ./docker_data/bob_inbox:/app/received_files
+      - ./docker_data/bob_send:/send
