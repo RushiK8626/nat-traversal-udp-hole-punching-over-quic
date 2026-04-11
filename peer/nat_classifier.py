@@ -45,7 +45,7 @@ class NATClassifier:
         self.stun_port_2 = stun_port_2
         self.timeout = timeout
         self.retries = retries
-        self.extended_retries = retries + 3  # Additional retries for difficult network conditions
+        self.extended_retries = retries + 3  
     
     async def probe_port(self, sock: socket.socket, peer_id: str, 
                          server_port: int) -> Optional[Tuple[str, int]]:

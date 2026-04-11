@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 
 import requests
+from peer.quic_peer import QuicPeer
 
 
 def test_nat_classifier():
@@ -46,35 +47,25 @@ def test_nat_classifier():
         return False
 
 
-def test_token_auth():
-    """Test token generation and verification"""
-    print("\n=== Testing Token Authentication ===")
-    
+def test_quic_tls_config():
+    """Test that QUIC client config enforces TLS certificate verification"""
+    print("\n=== Testing QUIC TLS Authentication Config ===")
+
     try:
-        # Test directly without subprocess
-        import sys
-        sys.path.insert(0, 'peer')
-        from auth import TokenVerifier
-        
-        secret_key = b'test-secret-key'
-        verifier = TokenVerifier(secret_key)
-        
-        # Generate token
-        token = verifier.generate('alice', 'bob')
-        print(f"✓ Token generated: {token.token[:30]}...")
-        
-        # Verify token
-        valid, msg = verifier.verify(token.token, 'alice', 'bob')
-        
-        if valid:
-            print("✓ Token verification working")
+        import ssl
+
+        peer = QuicPeer('test-peer', 'certs/cert.pem', 'certs/key.pem')
+        config = peer._create_client_config()
+
+        if config.verify_mode == ssl.CERT_REQUIRED:
+            print("✓ QUIC TLS certificate verification is enforced")
             return True
-        else:
-            print(f"✗ Token verification failed: {msg}")
-            return False
-    
+
+        print("✗ QUIC TLS verification is not strict")
+        return False
+
     except Exception as e:
-        print(f"✗ Token auth error: {e}")
+        print(f"✗ QUIC TLS config test error: {e}")
         return False
 
 
@@ -92,6 +83,7 @@ def test_metrics_endpoint():
                 print("✓ Metrics endpoint working")
                 print(f"  Peer ID: {data.get('peer_id')}")
                 return True
+            return False
         else:
             print(f"✗ Metrics endpoint returned {response.status_code}")
             return False
@@ -178,7 +170,7 @@ def main():
     # Test components
     results = {
         'NAT Classifier': False,
-        'Token Auth': False,
+        'QUIC TLS Config': False,
         'Metrics Endpoint': False,
     }
     
@@ -193,7 +185,7 @@ def main():
         time.sleep(1)  # Give server time to start
         
         results['NAT Classifier'] = test_nat_classifier()
-        results['Token Auth'] = test_token_auth()
+        results['QUIC TLS Config'] = test_quic_tls_config()
         results['Metrics Endpoint'] = test_metrics_endpoint()
         
         server_proc.terminate()

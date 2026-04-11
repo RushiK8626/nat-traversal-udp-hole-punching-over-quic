@@ -229,8 +229,7 @@ class RendezvousServer:
                         # Calculate a synchronized start time (now + 500ms to allow message propagation)
                         punch_start_time = time.time() + 0.5
 
-                        # Notify both peers to start hole punching at the same time
-                        # Send mapped_addr as primary target, local_addr for hairpin NAT detection
+                        # Send peer info to requesting peer (peer A)
                         await websocket.send(json.dumps({
                             'type': 'peer_info',
                             'peer_id': peer_b_id,
@@ -240,16 +239,22 @@ class RendezvousServer:
                             'punch_start_time': punch_start_time
                         }))
 
+                        # Notify target peer (peer B) with error handling
+                        # If peer B is offline, the send will fail and we catch it
                         peer_b_ws = peer_b.websocket
                         if peer_b_ws is not None:
-                            await peer_b_ws.send(json.dumps({
-                                'type': 'peer_info',
-                                'peer_id': peer_a_id,
-                                'mapped_addr': list(peer_a.mapped_addr) if peer_a.mapped_addr else None,
-                                'local_addr': list(peer_a.local_addr) if peer_a.local_addr else None,
-                                'nat_type': peer_a.nat_type,
-                                'punch_start_time': punch_start_time
-                            }))
+                            try:
+                                await peer_b_ws.send(json.dumps({
+                                    'type': 'peer_info',
+                                    'peer_id': peer_a_id,
+                                    'mapped_addr': list(peer_a.mapped_addr) if peer_a.mapped_addr else None,
+                                    'local_addr': list(peer_a.local_addr) if peer_a.local_addr else None,
+                                    'nat_type': peer_a.nat_type,
+                                    'punch_start_time': punch_start_time
+                                }))
+                            except websockets.exceptions.ConnectionClosed:
+                                logger.warning(f"Target peer {peer_b_id} disconnected while notifying of connection")
+                                self.peers.pop(peer_b_id, None)
 
                         logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}, punch starts at {punch_start_time}")
                         logger.info(f"  {peer_a_id} -> {peer_b}: {peer_b.mapped_addr}")
@@ -326,15 +331,26 @@ class RendezvousServer:
     async def start(self):
         """Start the rendezvous server"""
         loop = asyncio.get_event_loop()
-        
+
+        # Create sockets with SO_REUSEADDR for UDP to allow quick restarts
+        import socket as sock_module
+
+        sock1 = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_DGRAM)
+        sock1.setsockopt(sock_module.SOL_SOCKET, sock_module.SO_REUSEADDR, 1)
+        sock1.bind((self.host, self.stun_port_1))
+
+        sock2 = sock_module.socket(sock_module.AF_INET, sock_module.SOCK_DGRAM)
+        sock2.setsockopt(sock_module.SOL_SOCKET, sock_module.SO_REUSEADDR, 1)
+        sock2.bind((self.host, self.stun_port_2))
+
         # Start STUN UDP sockets
         stun1_transport, _ = await loop.create_datagram_endpoint(
             lambda: StunProtocol(self, 1),
-            local_addr=(self.host, self.stun_port_1)
+            sock=sock1
         )
         stun2_transport, _ = await loop.create_datagram_endpoint(
             lambda: StunProtocol(self, 2),
-            local_addr=(self.host, self.stun_port_2)
+            sock=sock2
         )
         
         # Start WebSocket server
