@@ -26,7 +26,7 @@ from aioquic.quic.events import (
 )
 from aioquic.tls import SessionTicket, SessionTicketHandler
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('quic_peer')
 
 # Stream IDs - Client uses 0,4,8 (% 4 == 0), Server uses 1,5,9 (% 4 == 1)
@@ -145,18 +145,20 @@ class QuicPeerProtocol(QuicConnectionProtocol):
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle QUIC events"""
         if isinstance(event, HandshakeCompleted):
-            logger.info(f"QUIC handshake completed (0-RTT: {event.early_data_accepted})")
+            early_data = event.early_data_accepted if hasattr(event, 'early_data_accepted') else False
+            logger.info(f"[QUIC-HS] Handshake completed | 0-RTT={'YES' if early_data else 'NO'} | Client={self.is_client}")
             self.connected.set()
         
         elif isinstance(event, StreamDataReceived):
             self._handle_stream_data(event.stream_id, event.data, event.end_stream)
         
         elif isinstance(event, ConnectionTerminated):
-            logger.info(f"Connection terminated: {event.error_code} - {event.reason_phrase}")
-            self.connected.clear()
+            logger.warning(f"[QUIC-TERM] Connection terminated | Error={event.error_code} | Reason={event.reason_phrase}")
     
     def _handle_stream_data(self, stream_id: int, data: bytes, end_stream: bool):
         """Handle data received on a stream"""
+        import struct
+        
         # Determine stream type: control (0,1), chat (4,5), file (8,9)
         stream_type = stream_id % 4  # 0 = client bidir, 1 = server bidir
         stream_category = (stream_id // 4) % 3  # 0 = control, 1 = chat, 2 = file
@@ -165,19 +167,38 @@ class QuicPeerProtocol(QuicConnectionProtocol):
             self.stream_stats[stream_id] = StreamStats()
         
         self.stream_stats[stream_id].bytes_received += len(data)
-        self.stream_stats[stream_id].messages_received += 1
         
         try:
-            # Control stream (0 or 1)
-            if stream_category == 0:
-                msg = json.loads(data.decode())
-                self._handle_control_message(msg, stream_id)
-            
-            # Chat stream (4 or 5)
-            elif stream_category == 1:
-                msg = json.loads(data.decode())
-                if msg.get('type') == MSG_CHAT and self.on_chat_message:
-                    self.on_chat_message(msg.get('from', 'unknown'), msg.get('text', ''))
+            # Control stream (0 or 1) and Chat stream (4 or 5) - use length-prefix framing
+            if stream_category == 0 or stream_category == 1:
+                # Store buffered data per stream
+                if not hasattr(self, '_stream_buffers'):
+                    self._stream_buffers = {}
+                if stream_id not in self._stream_buffers:
+                    self._stream_buffers[stream_id] = b''
+                
+                self._stream_buffers[stream_id] += data
+                
+                # Process complete framed messages
+                while len(self._stream_buffers[stream_id]) >= 4:
+                    msg_len = struct.unpack('>I', self._stream_buffers[stream_id][:4])[0]
+                    if len(self._stream_buffers[stream_id]) < 4 + msg_len:
+                        break  # Wait for complete message
+                    
+                    msg_data = self._stream_buffers[stream_id][4:4 + msg_len]
+                    self._stream_buffers[stream_id] = self._stream_buffers[stream_id][4 + msg_len:]
+                    
+                    self.stream_stats[stream_id].messages_received += 1
+                    
+                    msg = json.loads(msg_data.decode())
+                    
+                    # Control stream
+                    if stream_category == 0:
+                        self._handle_control_message(msg, stream_id)
+                    # Chat stream
+                    else:
+                        if msg.get('type') == MSG_CHAT and self.on_chat_message:
+                            self.on_chat_message(msg.get('from', 'unknown'), msg.get('text', ''))
             
             # File stream (8 or 9) - has its own error handling for binary chunks
             elif stream_category == 2:
@@ -190,6 +211,8 @@ class QuicPeerProtocol(QuicConnectionProtocol):
     
     def _handle_control_message(self, msg: dict, received_stream_id: int = 0):
         """Handle control stream messages"""
+        import struct
+        
         msg_type = msg.get('type')
         
         if msg_type == MSG_PING:
@@ -197,9 +220,12 @@ class QuicPeerProtocol(QuicConnectionProtocol):
             pong = json.dumps({
                 'type': MSG_PONG,
                 'seq': msg.get('seq'),
-                'ts': msg.get('ts')
+                'ts': msg.get('ts'),
+                'rtt_ms': (time.time() - msg.get('ts', time.time())) * 1000
             }).encode()
-            self._quic.send_stream_data(self.stream_control, pong, end_stream=False)
+            # Frame with length prefix
+            framed_pong = struct.pack('>I', len(pong)) + pong
+            self._quic.send_stream_data(self.stream_control, framed_pong, end_stream=False)
             self.transmit()
         
         elif msg_type == MSG_PONG:
@@ -273,6 +299,8 @@ class QuicPeerProtocol(QuicConnectionProtocol):
     
     async def send_ping(self) -> Optional[float]:
         """Send ping and wait for pong, return RTT in ms"""
+        import struct
+        
         self._ping_seq += 1
         seq = self._ping_seq
         self._ping_times[seq] = time.time()
@@ -283,9 +311,11 @@ class QuicPeerProtocol(QuicConnectionProtocol):
             'ts': time.time()
         }).encode()
         
-        self._quic.send_stream_data(self.stream_control, ping, end_stream=False)
+        # Frame with length prefix
+        framed_ping = struct.pack('>I', len(ping)) + ping
+        self._quic.send_stream_data(self.stream_control, framed_ping, end_stream=False)
         self.transmit()
-        self.stream_stats[self.stream_control].bytes_sent += len(ping)
+        self.stream_stats[self.stream_control].bytes_sent += len(framed_ping)
         self.stream_stats[self.stream_control].messages_sent += 1
         
         # Wait for pong (with timeout)
@@ -299,6 +329,8 @@ class QuicPeerProtocol(QuicConnectionProtocol):
     
     def send_chat(self, text: str, from_peer: str):
         """Send chat message"""
+        import struct
+        
         msg = json.dumps({
             'type': MSG_CHAT,
             'from': from_peer,
@@ -306,9 +338,11 @@ class QuicPeerProtocol(QuicConnectionProtocol):
             'ts': time.time()
         }).encode()
         
-        self._quic.send_stream_data(self.stream_chat, msg, end_stream=False)
+        # Frame with length prefix
+        framed_msg = struct.pack('>I', len(msg)) + msg
+        self._quic.send_stream_data(self.stream_chat, framed_msg, end_stream=False)
         self.transmit()
-        self.stream_stats[self.stream_chat].bytes_sent += len(msg)
+        self.stream_stats[self.stream_chat].bytes_sent += len(framed_msg)
         self.stream_stats[self.stream_chat].messages_sent += 1
     
     async def send_file(self, filepath: str, file_id: str, chunk_size: int = 16384):
@@ -412,7 +446,7 @@ class QuicPeer:
         return config
     
     async def connect(self, host: str, port: int, 
-                      local_port: Optional[int] = None) -> QuicPeerProtocol:
+                      local_port: Optional[int] = None, auth_token: str = None) -> QuicPeerProtocol:
         """
         Connect to a QUIC peer.
         
@@ -421,6 +455,9 @@ class QuicPeer:
             port: Remote port
             local_port: Local port to bind (for hole punching, use same port)
         """
+
+        # Store stoken for verification
+        self._auth_token = auth_token
         config = self._create_client_config()
         
         # Check for existing session ticket
@@ -431,6 +468,9 @@ class QuicPeer:
                 break
         
         logger.info(f"Connecting to {host}:{port}")
+
+        if auth_token:
+            logger.info(f"Connecting with auth token, expires in {self._auth_token['expiry'] - time.time()}s")
         
         start_time = time.time()
         

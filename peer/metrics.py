@@ -21,7 +21,7 @@ from http.server import HTTPServer, BaseHTTPRequestHandler
 from functools import partial
 import os
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('metrics')
 
 
@@ -84,7 +84,7 @@ class MetricsCollector:
                 connection_start_time=time.time()
             )
             self.connections[target_peer_id] = metrics
-            logger.info(f"Started tracking connection to {target_peer_id}")
+            logger.debug(f"[METRICS] Started tracking connection to {target_peer_id}")
             return metrics
     
     def get_connection(self, target_peer_id: str) -> Optional[ConnectionMetrics]:

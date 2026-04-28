@@ -8,13 +8,18 @@ Rendezvous Server
 import asyncio
 import json
 import base64
+import os
 import time
 import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Set
 import websockets
+from peer.auth import TokenVerifier
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s'
+)
 logger = logging.getLogger('rendezvous')
 
 # Configuration
@@ -74,6 +79,18 @@ class StunProtocol(asyncio.DatagramProtocol):
             logger.debug(f"Probe from {peer_id} @ {addr} on port {self.port_id}")
             
             # Store mapping for relay purposes
+            try:
+                # Schedule update in event loop
+                asyncio.run_coroutine_threadsafe(
+                    self._update_peer_mapping(peer_id, addr), 
+                    asyncio.get_event_loop()
+                )
+            except Exception as e:
+                logger.error(f"Failed to update mapping: {e}")
+            
+    # async-aware update method
+    async def _update_peer_mapping(self, peer_id: str, addr: Tuple[str, int]):
+        async with self.server.mappings_lock:
             self.server.peer_mappings[peer_id] = addr
     
     def error_received(self, exc):
@@ -126,6 +143,7 @@ class RendezvousServer:
     
     def __init__(self, host: str = '0.0.0.0', ws_port: int = WS_PORT,
                  stun_port_1: int = STUN_PORT_1, stun_port_2: int = STUN_PORT_2):
+        self.secret_key = os.environ.get('NAT_SECRET_KEY', 'default-secret').encode()
         self.host = host
         self.ws_port = ws_port
         self.stun_port_1 = stun_port_1
@@ -134,7 +152,11 @@ class RendezvousServer:
         self.peers: Dict[str, PeerInfo] = {}
         self.peer_mappings: Dict[str, Tuple[str, int]] = {}  # peer_id -> (ip, port)
         self.active_sessions: Dict[str, Set[str]] = {}  # session_id -> {peer_ids}
-    
+
+        self.peers_lock = asyncio.Lock()
+        self.mappings_lock = asyncio.Lock()
+        self.sessions_lock = asyncio.Lock()
+
     async def handle_websocket(self, websocket):
         """Handle WebSocket connection from a peer"""
         peer_id = None
@@ -150,26 +172,34 @@ class RendezvousServer:
                     nat_type = data.get('nat_type')
 
                     # Extract peer's public IP from WebSocket connection if NAT classification failed
-                    if not mapped_addr and local_addr:
+                    # Extract peer's public IP from WebSocket connection if NAT classification failed
+                    if not mapped_addr:
                         try:
-                            # Get client's IP from websocket connection
                             client_ip = websocket.remote_address[0]
-                            # Use the peer's local port as the likely mapped port
-                            # (better than guessing - actual mapped port might differ, but this is our best guess)
-                            mapped_port = local_addr[1]
+                            # Use local_addr port if available, otherwise use 0 as placeholder
+                            mapped_port = local_addr[1] if local_addr else 0
                             mapped_addr = (client_ip, mapped_port)
-                            logger.info(f"No mapped_addr from peer {peer_id}, using websocket source IP {client_ip}:{mapped_port} (derived from local port)")
+                            logger.info(f"No mapped_addr from peer {peer_id}, using websocket source IP {client_ip}:{mapped_port}")
                         except Exception as e:
                             logger.warning(f"Could not extract mapped address from websocket for {peer_id}: {e}")
-
-                    self.peers[peer_id] = PeerInfo(
-                        peer_id=peer_id,
-                        mapped_addr=mapped_addr,
-                        local_addr=local_addr,
-                        nat_type=nat_type,
-                        websocket=websocket
-                    )
                     
+                    async with self.peers_lock:
+                        if peer_id in self.peers:
+                            existing = self.peers[peer_id]
+                            if existing.websocket and existing.websocket != websocket:
+                                logger.warning(f"Peer {peer_id} re-registered, closing old connection")
+                                try:
+                                    await existing.websocket.close()
+                                except:
+                                    pass
+                        self.peers[peer_id] = PeerInfo(
+                            peer_id=peer_id,
+                            mapped_addr=mapped_addr,
+                            local_addr=local_addr,
+                            nat_type=nat_type,
+                            websocket=websocket
+                        )
+                        
                     await websocket.send(json.dumps({
                         'type': 'registered',
                         'peer_id': peer_id,
@@ -181,22 +211,24 @@ class RendezvousServer:
                     # Peer A wants to connect to Peer B
                     peer_a_id = data.get('peer_a_id')
                     peer_b_id = data.get('peer_b_id')
+                    auth_token = data.get('auth_token')
 
-                    if not peer_a_id or not peer_b_id:
-                        await websocket.send(json.dumps({
-                            'type': 'connect_failed',
-                            'reason': 'connect_request missing peer_a_id or peer_b_id'
-                        }))
-                        continue
+                    async with self.peers_lock:
+                        if not peer_a_id or not peer_b_id:
+                            await websocket.send(json.dumps({
+                                'type': 'connect_failed',
+                                'reason': 'connect_request missing peer_a_id or peer_b_id'
+                            }))
+                            continue
 
-                    # Prevent identity spoofing inside signalling by requiring
-                    # connect_request identity to match the registered websocket peer.
-                    if peer_id != peer_a_id:
-                        await websocket.send(json.dumps({
-                            'type': 'connect_failed',
-                            'reason': 'peer_a_id mismatch for websocket session'
-                        }))
-                        continue
+                        # Prevent identity spoofing inside signalling by requiring
+                        # connect_request identity to match the registered websocket peer.
+                        if peer_id != peer_a_id:
+                            await websocket.send(json.dumps({
+                                'type': 'connect_failed',
+                                'reason': 'peer_a_id mismatch for websocket session'
+                            }))
+                            continue
                     
                     # Check if peer B is registered
                     if peer_b_id not in self.peers:
@@ -207,9 +239,24 @@ class RendezvousServer:
                         }))
                         logger.debug(f"Connect request from {peer_a_id} to {peer_b_id} failed: peer not registered (online: {online_peers})")
                         continue
-                    
+
+                    if auth_token:
+                        is_valid, error_msg = self._verify_token(auth_token, peer_a_id, peer_b_id)
+                        if not is_valid:
+                            await websocket.send(json.dumps({
+                                'type': 'connect_failed',
+                                'reason': f'Invalid auth token: {error_msg}'
+                            }))
+                            logger.warning(f"Connect request from {peer_a_id} to {peer_b_id} failed: invalid auth token ({error_msg})")
+                            continue
+                        logger.info(f"Token verified for connection {peer_a_id} -> {peer_b_id}")
+
                     peer_a = self.peers.get(peer_a_id)
-                    peer_b = self.peers[peer_b_id]
+                    async with self.peers_lock:
+                        peer_b = self.peers.get(peer_b_id)
+                        if not peer_b or not peer_b.websocket:
+                            logger.warning(f"Peer {peer_b_id} not found or disconnected")
+                            continue
 
                     # Always use mapped_addr (public) first, only use local_addr for hairpin NAT detection
                     # Never send private IP (10.x, 172.16-31.x, 192.168.x) as primary target
@@ -242,6 +289,7 @@ class RendezvousServer:
                         # Notify target peer (peer B) with error handling
                         # If peer B is offline, the send will fail and we catch it
                         peer_b_ws = peer_b.websocket
+
                         if peer_b_ws is not None:
                             try:
                                 await peer_b_ws.send(json.dumps({
@@ -253,8 +301,9 @@ class RendezvousServer:
                                     'punch_start_time': punch_start_time
                                 }))
                             except websockets.exceptions.ConnectionClosed:
+                                async with self.peers_lock:
+                                    self.peers.pop(peer_b_id, None)
                                 logger.warning(f"Target peer {peer_b_id} disconnected while notifying of connection")
-                                self.peers.pop(peer_b_id, None)
 
                         logger.info(f"Exchanged addresses between {peer_a_id} and {peer_b_id}, punch starts at {punch_start_time}")
                         logger.info(f"  {peer_a_id} -> {peer_b}: {peer_b.mapped_addr}")
@@ -280,8 +329,15 @@ class RendezvousServer:
                     
                     # Enable relay for these peers
                     session_id = f"{min(peer_a_id, peer_b_id)}:{max(peer_a_id, peer_b_id)}"
-                    self.active_sessions[session_id] = {peer_a_id, peer_b_id}
                     
+                    async with self.peers_lock:
+                        if peer_a_id not in self.peers or peer_b_id not in self.peers:
+                            await websocket.send(json.dumps({'type': 'relay_failed', 'reason': '...'}))
+                            continue
+
+                    async with self.sessions_lock:
+                        self.active_sessions[session_id] = {peer_a_id, peer_b_id}
+                        
                     await websocket.send(json.dumps({
                         'type': 'relay_ready',
                         'session_id': session_id
@@ -311,23 +367,58 @@ class RendezvousServer:
                     if target_peer_id in self.peers and self.peers[target_peer_id].websocket:
                         target_ws = self.peers[target_peer_id].websocket
                         if target_ws is not None:
-                            await target_ws.send(json.dumps({
-                                'type': 'relay_frame',
-                                'source': peer_id,
-                                'payload': data['payload']
-                            }))
-                
+                            try:
+                                await target_ws.send(json.dumps({
+                                    'type': 'relay_frame',
+                                    'source': peer_id,
+                                    'payload': data['payload']
+                                }))
+                            except websockets.exceptions.ConnectionClosed:
+                                async with self.peers_lock:
+                                    self.peers.pop(target_peer_id, None)
+                                            
                 elif msg_type == 'ping':
                     await websocket.send(json.dumps({'type': 'pong', 'ts': data.get('ts')}))
         
+                elif msg_type == 'request_token':
+                    peer_a = data.get('peer_a_id')
+                    peer_b = data.get('peer_b_id')
+                    token = self._generate_token(peer_a, peer_b)
+                    await websocket.send(json.dumps({
+                        'type': 'token',
+                        'token': token.token,
+                        'expiry': token.expiry
+                    }))
+
         except websockets.exceptions.ConnectionClosed:
             logger.info(f"Peer {peer_id} disconnected")
         except Exception as e:
             logger.error(f"WebSocket error: {e}")
         finally:
-            if peer_id and peer_id in self.peers:
-                del self.peers[peer_id]
+            if peer_id:
+                async with self.peers_lock:
+                    self.peers.pop(peer_id, None)
+                async with self.mappings_lock:
+                    self.peer_mappings.pop(peer_id, None)
+                async with self.sessions_lock:
+                    # Remove stale sessions
+                    stale = [sid for sid, members in self.active_sessions.items() if peer_id in members]
+                    for sid in stale:
+                        del self.active_sessions[sid]
     
+    def _generate_token(self, peer_a_id: str, peer_b_id: str, expiry_secs: int = 60):
+        verifier = TokenVerifier(self.secret_key)
+        return verifier.generate(peer_a_id, peer_b_id, expiry_secs)
+
+    def _verify_token(self, token_str: str, expected_peer_a: str, expected_peer_b: str) -> Tuple[bool, str]:
+        """Verify a connection token from a peer"""
+        try:
+            verifier = TokenVerifier(self.secret_key)
+            is_valid, error_msg = verifier.verify(token_str, expected_peer_a, expected_peer_b)
+            return is_valid, error_msg
+        except Exception as e:
+            return False, f"Verification error: {str(e)}"
+        
     async def start(self):
         """Start the rendezvous server"""
         loop = asyncio.get_event_loop()

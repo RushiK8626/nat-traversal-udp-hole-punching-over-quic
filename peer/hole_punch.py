@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('hole_punch')
 
 PUNCH_INTERVAL_MS = 100  # Send every 100ms (more aggressive)
@@ -85,7 +85,7 @@ class HolePuncher:
         loop = asyncio.get_event_loop()
         max_attempts = PUNCH_TIMEOUT_MS // PUNCH_INTERVAL_MS
         
-        logger.info(f"Starting hole punch to {target_addr[0]}:{target_addr[1]}")
+        logger.info(f"[PUNCH] Starting hole punch to {target_addr[0]}:{target_addr[1]} (timeout={PUNCH_TIMEOUT_MS}ms, interval={PUNCH_INTERVAL_MS}ms)")
         
         # Create tasks for sending and receiving
         send_task = asyncio.create_task(self._send_punches(target_addr, max_attempts))
@@ -110,7 +110,7 @@ class HolePuncher:
             elapsed_ms = (time.time() - start_time) * 1000
             
             if self._punch_received.is_set():
-                logger.info(f"Hole punch SUCCESS in {elapsed_ms:.0f}ms")
+                logger.info(f"[PUNCH] SUCCESS in {elapsed_ms:.0f}ms with ~{int(elapsed_ms / PUNCH_INTERVAL_MS)} attempts | Peer confirmed at {self._peer_confirmed_addr}")
                 if on_success:
                     on_success()
                 return HolePunchResult(
@@ -120,7 +120,7 @@ class HolePuncher:
                     peer_addr=self._peer_confirmed_addr or target_addr
                 )
             else:
-                logger.warning(f"Hole punch FAILED after {elapsed_ms:.0f}ms")
+                logger.warning(f"[PUNCH] FAILED after {elapsed_ms:.0f}ms | No response from {target_addr[0]}:{target_addr[1]}")
                 return HolePunchResult(
                     success=False,
                     time_taken_ms=elapsed_ms,
@@ -130,7 +130,7 @@ class HolePuncher:
         
         except Exception as e:
             elapsed_ms = (time.time() - start_time) * 1000
-            logger.error(f"Hole punch error: {e}")
+            logger.error(f"[PUNCH] Error after {elapsed_ms:.0f}ms: {e}")
             return HolePunchResult(
                 success=False,
                 time_taken_ms=elapsed_ms,

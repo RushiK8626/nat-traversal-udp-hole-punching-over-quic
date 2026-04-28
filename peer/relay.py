@@ -14,7 +14,7 @@ from typing import Optional, Callable, Dict
 import websockets
 from websockets.client import WebSocketClientProtocol
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('relay')
 
 MAX_RELAY_PAYLOAD = 4096  # 4KB limit for relay mode
@@ -58,7 +58,9 @@ class RelayClient:
     async def connect(self) -> bool:
         """Connect to relay server"""
         try:
+            logger.debug(f"[RELAY] Connecting to relay server {self.server_url}...")
             self.websocket = await websockets.connect(self.server_url)
+            logger.debug(f"[RELAY] Connected, registering...")
             
             # Register with server
             await self.websocket.send(json.dumps({
@@ -72,15 +74,16 @@ class RelayClient:
             data = json.loads(response)
             
             if data.get('type') == 'registered':
-                logger.info(f"Registered with relay server as {self.peer_id}")
+                logger.info(f"[RELAY] Registered with relay server as {self.peer_id}")
                 self._running = True
                 self._receive_task = asyncio.create_task(self._receive_loop())
                 return True
             
+            logger.warning(f"[RELAY] Registration failed: {data}")
             return False
         
         except Exception as e:
-            logger.error(f"Failed to connect to relay: {e}")
+            logger.error(f"[RELAY] Connection failed: {e}")
             return False
     
     async def request_relay(self, target_peer_id: str) -> bool:

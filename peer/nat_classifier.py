@@ -16,7 +16,7 @@ import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('nat_classifier')
 
 
