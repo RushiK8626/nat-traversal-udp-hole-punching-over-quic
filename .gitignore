@@ -5,6 +5,7 @@ __pycache__/
 /certs
 /.vscode
 /docker_data
+/docs
 *.md
 !README.md
 metrics.json
