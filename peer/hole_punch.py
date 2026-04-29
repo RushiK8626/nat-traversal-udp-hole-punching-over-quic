@@ -37,18 +37,20 @@ class HolePuncher:
     Both peers must call punch() simultaneously after exchanging addresses.
     """
     
-    def __init__(self, local_socket: socket.socket, peer_id: str):
+    def __init__(self, local_socket: socket.socket, peer_id: str, expected_peer_id: str = None):
         """
         Args:
             local_socket: UDP socket to use (same one used for NAT classification)
             peer_id: This peer's ID
+            expected_peer_id: The ID of the peer we expect to punch
         """
         self.sock = local_socket
         self.peer_id = peer_id
         # Socket timeout is managed per-operation to avoid race conditions
         self._punch_received = asyncio.Event()
         self._peer_confirmed_addr: Optional[Tuple[str, int]] = None
-    
+        self.expected_peer_id = expected_peer_id
+
     def _create_punch_packet(self, sequence: int) -> bytes:
         """Create a hole punch packet"""
         data = {
@@ -139,112 +141,94 @@ class HolePuncher:
             )
     
     async def _send_punches(self, target_addr: Tuple[str, int], max_attempts: int):
-        """Send punch packets at regular intervals with initial burst"""
-        loop = asyncio.get_event_loop()
-        
-        # Send initial burst of packets to quickly open NAT binding
+        """Send punch packets at regular intervals"""
+        # Initial burst
         logger.info(f"Sending initial burst to {target_addr}")
         for i in range(5):
-            packet = self._create_punch_packet(i)
             try:
-                await loop.run_in_executor(
-                    None,
-                    lambda p=packet, t=target_addr: self.sock.sendto(p, t)
-                )
+                self.sock.sendto(self._create_punch_packet(i), target_addr)
             except Exception as e:
                 logger.debug(f"Burst send error: {e}")
-            await asyncio.sleep(0.02)  # 20ms between burst packets
-        
-        # Continue with regular interval punches
+            await asyncio.sleep(0.005)
+
+        # Regular interval punches
         for seq in range(5, max_attempts):
             if self._punch_received.is_set():
                 break
-            
-            packet = self._create_punch_packet(seq)
             try:
-                # Use run_in_executor for thread-safe send (avoids socket mode conflicts)
-                await loop.run_in_executor(
-                    None,
-                    lambda p=packet, t=target_addr: self.sock.sendto(p, t)
-                )
-                if seq % 10 == 0:  # Log every 10th attempt
+                self.sock.sendto(self._create_punch_packet(seq), target_addr)
+                if seq % 10 == 0:
                     logger.debug(f"Sent punch #{seq} to {target_addr}")
             except Exception as e:
                 logger.error(f"Send error: {e}")
-            
             await asyncio.sleep(PUNCH_INTERVAL_MS / 1000)
-    
+            
     async def _receive_punches(self, expected_addr: Tuple[str, int]):
-        """Listen for incoming punch packets using thread pool for Windows compatibility"""
+        """Listen for incoming punch packets using asyncio reader"""
         loop = asyncio.get_event_loop()
-
-        executor = ThreadPoolExecutor(max_workers=1)
-
-        def blocking_recv():
-            """Receive with timeout in a thread-safe way"""
-            # Set timeout each time to ensure consistent behavior
-            self.sock.settimeout(0.1)  # 100ms timeout for blocking recv
-            return self.sock.recvfrom(1024)
-
-        received_from = set()  # Track IPs we've received from
         punch_count = 0
+        received_from = set()
 
-        while not self._punch_received.is_set():
+        # Ensure non-blocking for add_reader
+        self.sock.setblocking(False)
+
+        future = loop.create_future()
+
+        def on_readable():
+            nonlocal punch_count
             try:
-                # Run blocking recv in thread pool for proper Windows compatibility
-                data, addr = await loop.run_in_executor(executor, blocking_recv)
-
-                is_punch, parsed = self._is_punch_packet(data)
-                if is_punch:
-                    punch_count += 1
-                    received_from.add(addr[0])
-                    if punch_count == 1 or punch_count % 5 == 0:  # Log first and every 5th punch
-                        logger.info(f"Received punch #{punch_count} from {addr}, peer_id={parsed.get('peer_id')}")
-
-                    # Accept punch from expected IP OR if it contains our expected peer_id
-                    # This handles symmetric NAT where port changes
-                    if addr[0] == expected_addr[0] or parsed.get('peer_id'):
-                        self._peer_confirmed_addr = addr
-                        self._punch_received.set()
-
-                        # Send multiple confirmations back (in case some are lost)
-                        confirm = json.dumps({
-                            'magic': PUNCH_MAGIC.decode(),
-                            'peer_id': self.peer_id,
-                            'type': 'confirm',
-                            'ts': time.time()
-                        }).encode()
-                        for _ in range(3):
-                            try:
-                                self.sock.sendto(confirm, addr)
-                            except:
-                                pass
-                        logger.info(f"Hole punch confirmed with peer at {addr} (received {punch_count} punches total)")
-                        executor.shutdown(wait=False)
-                        return
-                else:
-                    logger.debug(f"Received non-punch data from {addr}: {data[:50]}")
-
-            except socket.timeout:
-                # Expected timeout, continue loop
-                continue
-            except OSError as e:
-                # Handle socket errors (e.g., connection reset, would block)
-                if not self._punch_received.is_set():
-                    logger.debug(f"Socket error during receive: {e}")
-                    await asyncio.sleep(0.05)
+                data, addr = self.sock.recvfrom(4096)
+            except BlockingIOError:
+                return  # spurious wakeup, re-arm happens automatically
             except Exception as e:
-                if not self._punch_received.is_set():
-                    logger.debug(f"Receive error: {e}")
-                    await asyncio.sleep(0.05)
+                if not future.done():
+                    future.set_exception(e)
+                loop.remove_reader(self.sock.fileno())
+                return
 
-        if received_from:
-            logger.warning(f"Received {punch_count} punches from IPs: {received_from} but none matched expected {expected_addr[0]} - possible symmetric NAT or firewall blocking")
-        else:
-            logger.warning(f"No punches received from any IP (expected {expected_addr[0]}) - firewall or network isolation likely")
+            is_punch, parsed = self._is_punch_packet(data)
+            if not is_punch:
+                logger.debug(f"Non-punch data from {addr}: {data[:50]}")
+                return  # leave reader armed, wait for next packet
 
-        executor.shutdown(wait=False)
+            punch_count += 1
+            received_from.add(addr[0])
+            if punch_count == 1 or punch_count % 5 == 0:
+                logger.info(f"Received punch #{punch_count} from {addr}, peer_id={parsed.get('peer_id')}")
 
+            if (parsed.get('peer_id') == self.expected_peer_id and
+                    addr[0] == expected_addr[0]):
+                self._peer_confirmed_addr = addr
+                self._punch_received.set()
+                if not future.done():
+                    future.set_result(addr)
+                loop.remove_reader(self.sock.fileno())
+
+                # Send confirmations
+                confirm = json.dumps({
+                    'magic': PUNCH_MAGIC.decode(),
+                    'peer_id': self.peer_id,
+                    'type': 'confirm',
+                    'ts': time.time()
+                }).encode()
+                for _ in range(3):
+                    try:
+                        self.sock.sendto(confirm, addr)
+                    except Exception:
+                        pass
+                logger.info(f"Hole punch confirmed with {addr} ({punch_count} punches total)")
+
+        loop.add_reader(self.sock.fileno(), on_readable)
+        try:
+            await future
+        except asyncio.CancelledError:
+            loop.remove_reader(self.sock.fileno())
+            if received_from:
+                logger.warning(f"Punch timeout — got {punch_count} punches from {received_from} "
+                            f"but none matched expected IP {expected_addr[0]}")
+            else:
+                logger.warning(f"Punch timeout — no punches received (expected {expected_addr[0]})")
+            raise
 
 class BidirectionalHolePuncher:
     """

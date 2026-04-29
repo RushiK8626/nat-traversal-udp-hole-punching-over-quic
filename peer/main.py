@@ -2,6 +2,7 @@
 NAT Traversal Peer - Main Orchestrator
 Ties together all components:
 - NAT classification
+- Authentication with rendezvous server
 - Hole punching
 - QUIC transport with 0-RTT
 - Relay fallback
@@ -12,22 +13,22 @@ Ties together all components:
 import asyncio
 import argparse
 import json
+import base64
 import logging
 import os
 import time
 import socket
 import uuid
+import websockets
 from pathlib import Path
 from typing import Optional, Tuple
 
-import websockets
-
-from nat_classifier import NATClassifier, NATClassificationResult
-from hole_punch import HolePuncher, BidirectionalHolePuncher, HolePunchResult
-from quic_peer import QuicPeer, QuicPeerProtocol
-from relay import RelayClient, RelayPeerAdapter
-from metrics import MetricsCollector, MetricsServer
-from auth import TokenAuthClient
+from peer.nat_classifier import NATClassifier, NATClassificationResult
+from peer.hole_punch import BidirectionalHolePuncher, HolePunchResult
+from peer.quic_peer import QuicPeer, QuicPeerProtocol
+from peer.relay import RelayClient, RelayPeerAdapter
+from peer.metrics import MetricsCollector, MetricsServer
+from common.auth import TokenAuthClient, ConnectionToken
 
 logging.basicConfig(
     level=logging.INFO,
@@ -80,6 +81,7 @@ class PeerNode:
         )
         self.metrics = MetricsCollector(peer_id)
         self.metrics_server = MetricsServer(self.metrics, port=metrics_port)
+        self.auth_client = TokenAuthClient(peer_id, f"ws://{server_host}:{server_ws_port}")
         
         # State
         self.nat_result: Optional[NATClassificationResult] = None
@@ -90,6 +92,7 @@ class PeerNode:
         self._quic_peer: Optional[QuicPeer] = None  # Keep alive to prevent GC
         self.relay_client: Optional[RelayClient] = None
         self.using_relay = False
+        self.relay_target_peer_id: Optional[str] = None
         
         # Callbacks
         self.on_chat_message = None
@@ -101,6 +104,47 @@ class PeerNode:
         self._quic_lock = asyncio.Lock()
         self._protocol_lock = asyncio.Lock() 
         self._relay_lock = asyncio.Lock()
+
+    async def _send_relay_frame(self, target_peer_id: str, payload: bytes) -> bool:
+        """Send a relay frame via the signalling websocket (fallback path for listener peers)."""
+        if len(payload) > 4096:
+            logger.warning("Relay payload too large, dropping")
+            return False
+
+        payload_b64 = base64.b64encode(payload).decode()
+        try:
+            async with self._ws_lock:
+                if not self._is_websocket_open():
+                    if not await self._reconnect_signalling_locked():
+                        return False
+                await self.websocket.send(json.dumps({
+                    'type': 'relay_frame',
+                    'target': target_peer_id,
+                    'payload': payload_b64
+                }))
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send relay frame via signalling websocket: {e}")
+            return False
+
+    def _handle_signalling_relay_frame(self, source_peer: str, payload_b64: str) -> None:
+        """Handle relay frames received on the signalling websocket."""
+        try:
+            payload = base64.b64decode(payload_b64)
+            msg = json.loads(payload.decode())
+            msg_type = msg.get('type')
+
+            if msg_type == 'chat' and self.on_chat_message:
+                self.on_chat_message(msg.get('from', source_peer), msg.get('text', ''))
+            elif msg_type == 'control' and msg.get('control_type') == 'ping':
+                asyncio.create_task(self._send_relay_frame(source_peer, json.dumps({
+                    'type': 'control',
+                    'control_type': 'pong',
+                    'from': self.peer_id,
+                    'seq': msg.get('seq')
+                }).encode()))
+        except Exception as e:
+            logger.error(f"Error handling signalling relay frame: {e}")
     
     def _is_websocket_open(self) -> bool:
         """Check if websocket is open and usable."""
@@ -113,48 +157,7 @@ class PeerNode:
         except:
             return False
 
-    # async def _request_token_on_existing_ws(self, target_peer_id: str):
-    #     """Request auth token reusing the existing signalling websocket."""
-    #     try:
-    #         async with self._ws_lock:
-    #             if not self.websocket or not self._is_websocket_open():
-    #                 if not await self._reconnect_signalling_locked():
-    #                     return None
-                
-    #             await self.websocket.send(json.dumps({
-    #                 'type': 'request_token',
-    #                 'peer_a_id': self.peer_id,
-    #                 'peer_b_id': target_peer_id
-    #             }))
-                
-    #             response = await self.websocket.recv()
-    #     except websockets.exceptions.ConnectionClosed as e:
-    #         logger.warning(f"WebSocket closed while requesting token: {e}")
-    #         async with self._ws_lock:
-    #             if not await self._reconnect_signalling_locked():
-    #                 return None
-    #             # Retry with reconnected websocket
-    #             await self.websocket.send(json.dumps({
-    #                 'type': 'request_token',
-    #                 'peer_a_id': self.peer_id,
-    #                 'peer_b_id': target_peer_id
-    #             }))
-    #             response = await self.websocket.recv()
-        
-    #     data = json.loads(response)
-    #     if data.get('type') != 'token':
-    #         logger.error(f"Unexpected token response: {data}")
-    #         return None
-        
-    #     # Create ConnectionToken directly
-    #     from auth import ConnectionToken
-    #     return ConnectionToken(
-    #         token=data['token'],
-    #         peer_a=self.peer_id,
-    #         peer_b=target_peer_id,
-    #         expiry=data['expiry']
-    #     )
-    async def _request_token_on_existing_ws(self, target_peer_id: str):
+    async def _request_token_on_existing_ws(self, target_peer_id: str) -> Optional[ConnectionToken]:
         """Request auth token reusing the existing signalling websocket."""
         for attempt in range(2):
             try:
@@ -163,25 +166,10 @@ class PeerNode:
                         if not await self._reconnect_signalling_locked():
                             return None
 
-                    await self.websocket.send(json.dumps({
-                        'type': 'request_token',
-                        'peer_a_id': self.peer_id,
-                        'peer_b_id': target_peer_id
-                    }))
-                    response = await self.websocket.recv()
-
-                data = json.loads(response)
-                if data.get('type') != 'token':
-                    logger.error(f"Unexpected token response: {data}")
-                    return None
-
-                from auth import ConnectionToken
-                return ConnectionToken(
-                    token=data['token'],
-                    peer_a=self.peer_id,
-                    peer_b=target_peer_id,
-                    expiry=data['expiry']
-                )
+                    token = await self.auth_client.request_token_on_connection(
+                        self.websocket, target_peer_id
+                    )
+                    return token
 
             except websockets.exceptions.ConnectionClosed as e:
                 logger.warning(f"WebSocket closed while requesting token (attempt {attempt+1}): {e}")
@@ -504,6 +492,11 @@ class PeerNode:
         
         # Wait for synchronized punch start time if provided
         punch_start_time = peer_info.get('punch_start_time')
+        delay = (punch_start_time - time.time()) if punch_start_time else None
+        if delay > 0:
+            logger.info(f"[PUNCH] Synchronizing: waiting {delay:.2f}s before hole punch...")
+            await asyncio.sleep(delay)
+
         if punch_start_time:
             wait_time = punch_start_time - time.time()
             if wait_time > 0:
@@ -750,6 +743,17 @@ class PeerNode:
                     # Set up relay receiver
                     async with self._relay_lock:
                         self.using_relay = True
+                        if initiator:
+                            self.relay_target_peer_id = initiator
+
+                    if self.on_connected and initiator:
+                        self.on_connected(initiator, True)
+
+                elif msg_type == 'relay_frame':
+                    self._handle_signalling_relay_frame(
+                        data.get('source', ''),
+                        data.get('payload', '')
+                    )
             except websockets.exceptions.ConnectionClosed:
                 await self._reconnect_signalling()
             except Exception as e:
@@ -767,6 +771,11 @@ class PeerNode:
         
         # Wait for synchronized punch start time if provided
         punch_start_time = data.get('punch_start_time')
+        delay = (punch_start_time - time.time()) if punch_start_time else None
+        if delay and delay > 0:
+            logger.info(f"Waiting {delay:.2f}s for synchronized hole punch start...")
+            await asyncio.sleep(delay)
+            
         if punch_start_time:
             wait_time = punch_start_time - time.time()
             if wait_time > 0:
@@ -871,6 +880,17 @@ class PeerNode:
     
     async def send_chat(self, text: str):
         """Send chat message to connected peer"""
+        async with self._relay_lock:
+            if self.using_relay and self.relay_target_peer_id and not self.relay_client:
+                msg = json.dumps({
+                    'type': 'chat',
+                    'from': self.peer_id,
+                    'text': text,
+                    'ts': time.time()
+                }).encode()
+                await self._send_relay_frame(self.relay_target_peer_id, msg)
+                return
+
         async with self._protocol_lock:
             proto = self.protocol
             if proto and hasattr(proto, 'send_chat'):

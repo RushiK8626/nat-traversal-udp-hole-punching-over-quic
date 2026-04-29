@@ -66,6 +66,7 @@ class RelayClient:
             await self.websocket.send(json.dumps({
                 'type': 'register',
                 'peer_id': self.peer_id,
+                'relay_only': True,
                 'mapped_addr': None,  # Not needed for relay mode
                 'nat_type': 'relay'
             }))

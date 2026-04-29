@@ -94,29 +94,28 @@ class NATClassifier:
         return None
     
     async def _recv_with_select(self, sock: socket.socket, bufsize: int) -> bytes:
-        """Receive data using select for Windows compatibility"""
+        """Receive data using event loop reader (cross-platform, no busy-poll)"""
         loop = asyncio.get_event_loop()
-        
-        # Create a future for the receive
         future = loop.create_future()
-        
-        def check_readable():
+
+        def on_readable():
             try:
-                data, addr = sock.recvfrom(bufsize)
+                data, _ = sock.recvfrom(bufsize)
                 if not future.done():
                     future.set_result(data)
-                # Re-schedule to continue checking
-                loop.call_soon(check_readable)
-            except BlockingIOError:
-                # Would block - re-schedule
-                loop.call_later(0.001, check_readable)
             except Exception as e:
                 if not future.done():
                     future.set_exception(e)
-        
-        loop.call_soon(check_readable)
-        return await future
-    
+            finally:
+                loop.remove_reader(sock.fileno())  
+
+        loop.add_reader(sock.fileno(), on_readable)
+        try:
+            return await future
+        except asyncio.CancelledError:
+            loop.remove_reader(sock.fileno())  # cleanup on timeout/cancel
+            raise
+
     async def classify(self, peer_id: str, local_port: int = 0) -> Optional[NATClassificationResult]:
         """
         Classify NAT type by sending probes from same local port to different server ports.

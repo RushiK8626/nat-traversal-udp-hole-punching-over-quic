@@ -14,7 +14,7 @@ import logging
 from dataclasses import dataclass
 from typing import Any, Dict, Optional, Tuple, Set
 import websockets
-from peer.auth import TokenVerifier
+from common.auth import TokenVerifier
 
 logging.basicConfig(
     level=logging.INFO,
@@ -150,6 +150,7 @@ class RendezvousServer:
         self.stun_port_2 = stun_port_2
         
         self.peers: Dict[str, PeerInfo] = {}
+        self.relay_peers: Dict[str, Any] = {}  # peer_id -> relay websocket (aux channel)
         self.peer_mappings: Dict[str, Tuple[str, int]] = {}  # peer_id -> (ip, port)
         self.active_sessions: Dict[str, Set[str]] = {}  # session_id -> {peer_ids}
 
@@ -160,6 +161,7 @@ class RendezvousServer:
     async def handle_websocket(self, websocket):
         """Handle WebSocket connection from a peer"""
         peer_id = None
+        relay_only = False
         try:
             async for message in websocket:
                 data = json.loads(message)
@@ -167,9 +169,21 @@ class RendezvousServer:
 
                 if msg_type == 'register':
                     peer_id = data['peer_id']
+                    relay_only = bool(data.get('relay_only', False))
                     mapped_addr = tuple(data['mapped_addr']) if data.get('mapped_addr') else None
                     local_addr = tuple(data['local_addr']) if data.get('local_addr') else None
                     nat_type = data.get('nat_type')
+
+                    if relay_only:
+                        async with self.peers_lock:
+                            self.relay_peers[peer_id] = websocket
+                        await websocket.send(json.dumps({
+                            'type': 'registered',
+                            'peer_id': peer_id,
+                            'server_stun_ports': [self.stun_port_1, self.stun_port_2]
+                        }))
+                        logger.info(f"Relay websocket registered for peer {peer_id}")
+                        continue
 
                     # Extract peer's public IP from WebSocket connection if NAT classification failed
                     # Extract peer's public IP from WebSocket connection if NAT classification failed
@@ -211,7 +225,7 @@ class RendezvousServer:
                     # Peer A wants to connect to Peer B
                     peer_a_id = data.get('peer_a_id')
                     peer_b_id = data.get('peer_b_id')
-                    auth_token = data.get('auth_token')
+                    auth_token = data.get('auth_token') or data.get('token')
 
                     async with self.peers_lock:
                         if not peer_a_id or not peer_b_id:
@@ -274,7 +288,8 @@ class RendezvousServer:
                     # Exchange addresses (always use mapped_addr for P2P attempts)
                     if peer_a and peer_b:
                         # Calculate a synchronized start time (now + 500ms to allow message propagation)
-                        punch_start_time = time.time() + 0.5
+                        now = time.time()
+                        punch_start_time = now + 0.5
 
                         # Send peer info to requesting peer (peer A)
                         await websocket.send(json.dumps({
@@ -364,17 +379,24 @@ class RendezvousServer:
                         logger.warning("Relay frame too large, dropping")
                         continue
                     
-                    if target_peer_id in self.peers and self.peers[target_peer_id].websocket:
-                        target_ws = self.peers[target_peer_id].websocket
-                        if target_ws is not None:
-                            try:
-                                await target_ws.send(json.dumps({
-                                    'type': 'relay_frame',
-                                    'source': peer_id,
-                                    'payload': data['payload']
-                                }))
-                            except websockets.exceptions.ConnectionClosed:
-                                async with self.peers_lock:
+                    async with self.peers_lock:
+                        target_ws = self.relay_peers.get(target_peer_id)
+                        if target_ws is None and target_peer_id in self.peers:
+                            target_ws = self.peers[target_peer_id].websocket
+
+                    if target_ws is not None:
+                        try:
+                            await target_ws.send(json.dumps({
+                                'type': 'relay_frame',
+                                'source': peer_id,
+                                'payload': data['payload']
+                            }))
+                        except websockets.exceptions.ConnectionClosed:
+                            async with self.peers_lock:
+                                # Clean up whichever channel got disconnected.
+                                if self.relay_peers.get(target_peer_id) is target_ws:
+                                    self.relay_peers.pop(target_peer_id, None)
+                                elif target_peer_id in self.peers and self.peers[target_peer_id].websocket is target_ws:
                                     self.peers.pop(target_peer_id, None)
                                             
                 elif msg_type == 'ping':
@@ -397,9 +419,15 @@ class RendezvousServer:
         finally:
             if peer_id:
                 async with self.peers_lock:
-                    self.peers.pop(peer_id, None)
+                    if relay_only:
+                        if self.relay_peers.get(peer_id) is websocket:
+                            self.relay_peers.pop(peer_id, None)
+                    else:
+                        if peer_id in self.peers and self.peers[peer_id].websocket is websocket:
+                            self.peers.pop(peer_id, None)
                 async with self.mappings_lock:
-                    self.peer_mappings.pop(peer_id, None)
+                    if not relay_only:
+                        self.peer_mappings.pop(peer_id, None)
                 async with self.sessions_lock:
                     # Remove stale sessions
                     stale = [sid for sid, members in self.active_sessions.items() if peer_id in members]
