@@ -1,1 +1,11 @@
-.venv
+__pycache__/
+*.py[cod]
+*$py.class
+/*venv*
+/.vscode
+/docker_data
+*.md
+!README.md
+metrics.json
+demo*
+test*

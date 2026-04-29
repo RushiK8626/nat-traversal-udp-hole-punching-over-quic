@@ -1,36 +1,61 @@
 services:
   rendezvous:
-    build: .
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    image: rendezvous:v1
+    container_name: rendezvous
     command: python server/rendezvous.py --host 0.0.0.0
     ports:
       - "3478:3478/udp"
       - "3479:3479/udp"
       - "8765:8765"
+    networks:
+      - net_alice
+      - net_bob
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket; s=socket.create_connection(('127.0.0.1', 8765), 2); s.close()"]
-      interval: 2s
-      timeout: 2s
-      retries: 15
-
-  alice:
-    build: .
-    command: python peer/main.py --server rendezvous --peer-id alice
+      test: ["CMD", "python3", "-c", "import asyncio, websockets; loop=asyncio.get_event_loop(); ws=loop.run_until_complete(websockets.connect('ws://127.0.0.1:8765')); loop.run_until_complete(ws.close())"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 5s
+      
+  # Define the shared peer image via an anchor
+  x-peer: &peer-base
+    build:
+      context: .
+      dockerfile: peer/Dockerfile
+    image: peer:v1          # single shared image tag
     depends_on:
       rendezvous:
         condition: service_healthy
     stdin_open: true
     tty: true
+
+  alice:
+    <<: *peer-base
+    container_name: alice
+    command: python peer/main.py --server rendezvous --peer-id alice
+    networks:
+      - net_alice
     volumes:
       - ./docker_data/alice_inbox:/app/received_files
 
   bob:
-    build: .
+    <<: *peer-base
+    container_name: bob
     command: python peer/main.py --server rendezvous --peer-id bob --connect alice
-    depends_on:
-      rendezvous:
-        condition: service_healthy
-    stdin_open: true
-    tty: true
+    networks:
+      - net_bob
     volumes:
       - ./docker_data/bob_inbox:/app/received_files
       - ./docker_data/bob_send:/send
+
+networks:
+  net_alice:
+    driver: bridge
+  net_bob:
+    driver: bridge
+  net_punch:             
+    driver: bridge
+    internal: true  
