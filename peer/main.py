@@ -604,7 +604,7 @@ class PeerNode:
                 return await self._establish_relay(target_peer_id)
             
             connect_time = (time.time() - start_time) * 1000
-            is_0rtt = hasattr(self.protocol, '_quic') and self.protocol._quic.tls._session_resumed
+            is_0rtt = getattr(self.protocol, 'early_data_accepted', False)
             
             logger.info(f"[QUIC] Handshake complete in {connect_time:.1f}ms | 0-RTT={is_0rtt}")
             self.metrics.record_connection_established(target_peer_id, is_0rtt=is_0rtt)
