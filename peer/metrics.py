@@ -63,6 +63,8 @@ class ConnectionMetrics:
     # Byte counters
     total_bytes_sent: int = 0
     total_bytes_received: int = 0
+    total_messages_sent: int = 0
+    total_messages_received: int = 0
 
 
 class MetricsCollector:
@@ -148,7 +150,8 @@ class MetricsCollector:
                 self._save()
     
     def record_bytes(self, target_peer_id: str, stream_id: int, 
-                     sent: int = 0, received: int = 0):
+                     sent: int = 0, received: int = 0,
+                     msgs_sent: int = 0, msgs_received: int = 0):
         """Record bytes transferred"""
         with self._lock:
             if target_peer_id in self.connections:
@@ -157,13 +160,20 @@ class MetricsCollector:
                 if stream_id not in m.stream_stats:
                     m.stream_stats[stream_id] = {
                         'bytes_sent': 0,
-                        'bytes_received': 0
+                        'bytes_received': 0,
+                        'messages_sent': 0,
+                        'messages_received': 0
                     }
                 
                 m.stream_stats[stream_id]['bytes_sent'] += sent
                 m.stream_stats[stream_id]['bytes_received'] += received
+                m.stream_stats[stream_id]['messages_sent'] = m.stream_stats[stream_id].get('messages_sent', 0) + msgs_sent
+                m.stream_stats[stream_id]['messages_received'] = m.stream_stats[stream_id].get('messages_received', 0) + msgs_received
+                
                 m.total_bytes_sent += sent
                 m.total_bytes_received += received
+                m.total_messages_sent += msgs_sent
+                m.total_messages_received += msgs_received
                 self._save()
     
     def update_stream_stats(self, target_peer_id: str, stream_stats: Dict[int, dict]):
@@ -176,6 +186,8 @@ class MetricsCollector:
                 # Update totals
                 m.total_bytes_sent = sum(s.get('bytes_sent', 0) for s in stream_stats.values())
                 m.total_bytes_received = sum(s.get('bytes_received', 0) for s in stream_stats.values())
+                m.total_messages_sent = sum(s.get('messages_sent', 0) for s in stream_stats.values())
+                m.total_messages_received = sum(s.get('messages_received', 0) for s in stream_stats.values())
                 
                 self._save()
     
@@ -236,6 +248,8 @@ class MetricsCollector:
                     'bytes': {
                         'total_sent': metrics.total_bytes_sent,
                         'total_received': metrics.total_bytes_received,
+                        'total_msgs_sent': metrics.total_messages_sent,
+                        'total_msgs_received': metrics.total_messages_received,
                         'by_stream': metrics.stream_stats
                     }
                 }
@@ -273,7 +287,9 @@ class MetricsCollector:
                     'hole_punch_success': m.hole_punch_success,
                     'rtt_ms': m.last_rtt_ms,
                     'bytes_sent': m.total_bytes_sent,
-                    'bytes_received': m.total_bytes_received
+                    'bytes_received': m.total_bytes_received,
+                    'msgs_sent': m.total_messages_sent,
+                    'msgs_received': m.total_messages_received
                 })
             
             return summary
@@ -303,9 +319,9 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
             # Simple HTML dashboard
             html = self._generate_html()
             self.send_response(200)
-            self.send_header('Content-Type', 'text/html')
+            self.send_header('Content-Type', 'text/html; charset=utf-8')
             self.end_headers()
-            self.wfile.write(html.encode())
+            self.wfile.write(html.encode('utf-8'))
         
         else:
             self.send_response(404)
@@ -358,6 +374,8 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 <th>RTT (ms)</th>
                 <th>Bytes Sent</th>
                 <th>Bytes Received</th>
+                <th>Msgs Sent</th>
+                <th>Msgs Received</th>
             </tr>
 """
         
@@ -375,6 +393,8 @@ class MetricsHTTPHandler(BaseHTTPRequestHandler):
                 <td>{conn['rtt_ms']:.1f}</td>
                 <td>{conn['bytes_sent']:,}</td>
                 <td>{conn['bytes_received']:,}</td>
+                <td>{conn['msgs_sent']:,}</td>
+                <td>{conn['msgs_received']:,}</td>
             </tr>
 """
         
