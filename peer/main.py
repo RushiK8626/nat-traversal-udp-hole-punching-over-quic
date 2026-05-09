@@ -16,6 +16,8 @@ import json
 import base64
 import logging
 import os
+import sys
+import platform
 import time
 import socket
 import uuid
@@ -1141,4 +1143,8 @@ async def main():
 
 
 if __name__ == '__main__':
+    # On Windows, use SelectorEventLoop to support add_reader() on raw sockets
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     asyncio.run(main())

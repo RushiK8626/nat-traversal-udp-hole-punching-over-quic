@@ -164,7 +164,7 @@ class HolePuncher:
             await asyncio.sleep(PUNCH_INTERVAL_MS / 1000)
             
     async def _receive_punches(self, expected_addr: Tuple[str, int]):
-        """Listen for incoming punch packets using asyncio reader"""
+        """Listen for incoming punch packets using asyncio reader or fallback to polling"""
         loop = asyncio.get_event_loop()
         punch_count = 0
         received_from = set()
@@ -173,6 +173,7 @@ class HolePuncher:
         self.sock.setblocking(False)
 
         future = loop.create_future()
+        reader_added = False
 
         def on_readable():
             nonlocal punch_count
@@ -183,7 +184,11 @@ class HolePuncher:
             except Exception as e:
                 if not future.done():
                     future.set_exception(e)
-                loop.remove_reader(self.sock.fileno())
+                if reader_added:
+                    try:
+                        loop.remove_reader(self.sock.fileno())
+                    except:
+                        pass
                 return
 
             is_punch, parsed = self._is_punch_packet(data)
@@ -202,7 +207,11 @@ class HolePuncher:
                 self._punch_received.set()
                 if not future.done():
                     future.set_result(addr)
-                loop.remove_reader(self.sock.fileno())
+                if reader_added:
+                    try:
+                        loop.remove_reader(self.sock.fileno())
+                    except:
+                        pass
 
                 # Send confirmations
                 confirm = json.dumps({
@@ -218,11 +227,47 @@ class HolePuncher:
                         pass
                 logger.info(f"Hole punch confirmed with {addr} ({punch_count} punches total)")
 
-        loop.add_reader(self.sock.fileno(), on_readable)
+        # Try to use add_reader if available (SelectorEventLoop), fallback to polling
+        try:
+            loop.add_reader(self.sock.fileno(), on_readable)
+            reader_added = True
+            logger.debug("Using asyncio add_reader for punch reception")
+        except NotImplementedError:
+            logger.debug("add_reader not supported, falling back to polling-based reception")
+            # Fallback: polling-based receive
+            async def polling_receive():
+                while not future.done():
+                    try:
+                        data, addr = self.sock.recvfrom(4096)
+                        on_readable()  # Process the data via the same handler
+                    except BlockingIOError:
+                        await asyncio.sleep(0.001)  # Small delay between polls
+                    except Exception as e:
+                        if not future.done():
+                            future.set_exception(e)
+                        break
+            
+            polling_task = asyncio.create_task(polling_receive())
+            try:
+                await future
+            except asyncio.CancelledError:
+                polling_task.cancel()
+                if received_from:
+                    logger.warning(f"Punch timeout — got {punch_count} punches from {received_from} "
+                                f"but none matched expected IP {expected_addr[0]}")
+                else:
+                    logger.warning(f"Punch timeout — no punches received (expected {expected_addr[0]})")
+                raise
+            return
+        
         try:
             await future
         except asyncio.CancelledError:
-            loop.remove_reader(self.sock.fileno())
+            if reader_added:
+                try:
+                    loop.remove_reader(self.sock.fileno())
+                except:
+                    pass
             if received_from:
                 logger.warning(f"Punch timeout — got {punch_count} punches from {received_from} "
                             f"but none matched expected IP {expected_addr[0]}")
