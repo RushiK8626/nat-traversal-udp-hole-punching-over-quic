@@ -55,38 +55,43 @@ class StunProtocol(asyncio.DatagramProtocol):
         try:
             text = data.decode('utf-8')
         except UnicodeDecodeError:
-            logger.debug(f"Ignoring non-UTF8 UDP packet from {addr}")
+            logger.warning(f"Ignoring non-UTF8 UDP packet from {addr}")
             return
         
         try:
             request = json.loads(text)
         except json.JSONDecodeError:
-            logger.debug(f"Ignoring non-JSON UDP packet from {addr}: {text[:80]}")
+            logger.warning(f"Ignoring non-JSON UDP packet from {addr}: {text[:80]}")
             return
         
         if request.get('type') == 'probe':
             if self.transport is None:
+                logger.error(f"STUN transport is None on port {self.port_id}")
                 return
-            peer_id = request.get('peer_id', 'unknown')
-            response = {
-                'type': 'probe_response',
-                'port_id': self.port_id,
-                'mapped_ip': addr[0],
-                'mapped_port': addr[1],
-                'server_port': STUN_PORT_1 if self.port_id == 1 else STUN_PORT_2
-            }
-            self.transport.sendto(json.dumps(response).encode(), addr)
-            logger.debug(f"Probe from {peer_id} @ {addr} on port {self.port_id}")
             
-            # Store mapping for relay purposes
             try:
-                # Schedule update in event loop
-                asyncio.run_coroutine_threadsafe(
-                    self._update_peer_mapping(peer_id, addr), 
-                    asyncio.get_event_loop()
-                )
+                peer_id = request.get('peer_id', 'unknown')
+                response = {
+                    'type': 'probe_response',
+                    'port_id': self.port_id,
+                    'mapped_ip': addr[0],
+                    'mapped_port': addr[1],
+                    'server_port': STUN_PORT_1 if self.port_id == 1 else STUN_PORT_2
+                }
+                response_data = json.dumps(response).encode()
+                self.transport.sendto(response_data, addr)
+                logger.info(f"STUN probe response sent to {peer_id} @ {addr} on port {self.port_id}")
+                
+                # Store mapping for relay purposes
+                try:
+                    asyncio.run_coroutine_threadsafe(
+                        self._update_peer_mapping(peer_id, addr), 
+                        asyncio.get_event_loop()
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to update mapping: {e}")
             except Exception as e:
-                logger.error(f"Failed to update mapping: {e}")
+                logger.error(f"Failed to send STUN response: {e}")
             
     # async-aware update method
     async def _update_peer_mapping(self, peer_id: str, addr: Tuple[str, int]):

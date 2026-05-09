@@ -22,6 +22,10 @@ import uuid
 import websockets
 from pathlib import Path
 from typing import Optional, Tuple
+import sys
+
+# Add parent directory to path to allow imports when running as script
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from peer.nat_classifier import NATClassifier, NATClassificationResult
 from peer.hole_punch import BidirectionalHolePuncher, HolePunchResult
