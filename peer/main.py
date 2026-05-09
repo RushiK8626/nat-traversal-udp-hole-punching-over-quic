@@ -16,6 +16,8 @@ import json
 import base64
 import logging
 import os
+import sys
+import platform
 import time
 import socket
 import uuid
@@ -547,7 +549,7 @@ class PeerNode:
         my_nat = self.nat_result.nat_type if self.nat_result else 'unknown'
         puncher = BidirectionalHolePuncher(self.local_socket, self.peer_id)
         
-        return await puncher.execute(peer_addr, my_nat, peer_nat_type)
+        return await puncher.execute(peer_addr, my_nat, peer_nat_type, target_peer_id=target_peer_id)
     
     async def _establish_quic(self, target_peer_id: str, peer_addr: Tuple[str, int]) -> bool:
         """Establish QUIC connection after successful hole punch"""
@@ -1145,4 +1147,8 @@ async def main():
 
 
 if __name__ == '__main__':
+    # On Windows, use SelectorEventLoop to support add_reader() on raw sockets
+    if sys.platform == 'win32':
+        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+    
     asyncio.run(main())
