@@ -164,6 +164,7 @@ class MetricsCollector:
                 m.stream_stats[stream_id]['bytes_received'] += received
                 m.total_bytes_sent += sent
                 m.total_bytes_received += received
+                self._save()
     
     def update_stream_stats(self, target_peer_id: str, stream_stats: Dict[int, dict]):
         """Update stream statistics from QUIC protocol"""

@@ -100,6 +100,12 @@ class PeerNode:
         self.using_relay = False
         self.relay_target_peer_id: Optional[str] = None
         
+        # Listener-side relay ping tracking
+        self._relay_ping_seq: int = 0
+        self._relay_ping_times: dict = {}
+        self._relay_last_rtt_ms: float = 0.0
+        self._relay_rtt_samples: list = []
+        
         # Callbacks
         self.on_chat_message = None
         self.on_file_received = None
@@ -140,15 +146,32 @@ class PeerNode:
             msg = json.loads(payload.decode())
             msg_type = msg.get('type')
 
+            # Track receive stats on the metrics collector
+            target = source_peer or self.relay_target_peer_id
+            if target:
+                self.metrics.record_bytes(target, stream_id=4, received=len(payload))
+
             if msg_type == 'chat' and self.on_chat_message:
                 self.on_chat_message(msg.get('from', source_peer), msg.get('text', ''))
-            elif msg_type == 'control' and msg.get('control_type') == 'ping':
-                asyncio.create_task(self._send_relay_frame(source_peer, json.dumps({
-                    'type': 'control',
-                    'control_type': 'pong',
-                    'from': self.peer_id,
-                    'seq': msg.get('seq')
-                }).encode()))
+            elif msg_type == 'control':
+                control_type = msg.get('control_type')
+                if control_type == 'ping':
+                    asyncio.create_task(self._send_relay_frame(source_peer, json.dumps({
+                        'type': 'control',
+                        'control_type': 'pong',
+                        'from': self.peer_id,
+                        'seq': msg.get('seq'),
+                        'ts': msg.get('ts')
+                    }).encode()))
+                elif control_type == 'pong':
+                    # Resolve a pending ping and record RTT
+                    seq = msg.get('seq')
+                    if seq is not None and seq in self._relay_ping_times:
+                        rtt_ms = (time.time() - self._relay_ping_times.pop(seq)) * 1000
+                        self._relay_last_rtt_ms = rtt_ms
+                        self._relay_rtt_samples.append(rtt_ms)
+                        if target:
+                            self.metrics.record_rtt(target, rtt_ms)
         except Exception as e:
             logger.error(f"Error handling signalling relay frame: {e}")
     
@@ -684,12 +707,58 @@ class PeerNode:
             adapter.on_chat_message = self.on_chat_message
         
         self.protocol = adapter
+        self.metrics.record_connection_established(target_peer_id)
+        
+        # Start ping loop for RTT monitoring (same as QUIC mode)
+        await self.metrics.start_ping_loop(target_peer_id, adapter, interval=5.0)
+        
+        # Start periodic relay stats sync to metrics collector
+        asyncio.create_task(self._relay_stats_loop(target_peer_id))
         
         if self.on_connected:
             self.on_connected(target_peer_id, True)  # Using relay
         
         logger.info(f"[CONN] Connected to {target_peer_id} (Relay/WebSocket fallback)")
         return True
+    
+    async def _relay_stats_loop(self, target_peer_id: str):
+        """Periodically sync relay adapter stats into the metrics collector."""
+        try:
+            while True:
+                await asyncio.sleep(5.0)
+                async with self._protocol_lock:
+                    proto = self.protocol
+                if proto and isinstance(proto, RelayPeerAdapter):
+                    stats = proto.get_stats()
+                    self.metrics.update_stream_stats(target_peer_id, stats)
+                elif not self.using_relay:
+                    break  # No longer in relay mode
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Relay stats loop ended: {e}")
+    
+    async def _relay_ping_loop(self, target_peer_id: str, interval: float = 5.0):
+        """Periodic ping loop for listener-side relay RTT measurement via signalling websocket."""
+        try:
+            while self.using_relay:
+                await asyncio.sleep(interval)
+                if not self.using_relay:
+                    break
+                self._relay_ping_seq += 1
+                seq = self._relay_ping_seq
+                self._relay_ping_times[seq] = time.time()
+                await self._send_relay_frame(target_peer_id, json.dumps({
+                    'type': 'control',
+                    'control_type': 'ping',
+                    'from': self.peer_id,
+                    'seq': seq,
+                    'ts': time.time()
+                }).encode())
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.debug(f"Relay ping loop ended: {e}")
     
     async def listen_for_connections(self, callback=None):
         """Listen for incoming connection requests"""
@@ -751,6 +820,14 @@ class PeerNode:
                         self.using_relay = True
                         if initiator:
                             self.relay_target_peer_id = initiator
+
+                    # Start metrics tracking for the listener-side relay
+                    if initiator:
+                        self.metrics.start_connection(initiator)
+                        self.metrics.record_relay_fallback(initiator, session_id or '')
+                        self.metrics.record_connection_established(initiator)
+                        # Start RTT ping loop for listener-side relay
+                        asyncio.create_task(self._relay_ping_loop(initiator))
 
                     if self.on_connected and initiator:
                         self.on_connected(initiator, True)
@@ -894,7 +971,12 @@ class PeerNode:
                     'text': text,
                     'ts': time.time()
                 }).encode()
-                await self._send_relay_frame(self.relay_target_peer_id, msg)
+                success = await self._send_relay_frame(self.relay_target_peer_id, msg)
+                # Track send stats on the metrics collector for listener-side relay
+                if success:
+                    self.metrics.record_bytes(
+                        self.relay_target_peer_id, stream_id=4, sent=len(msg)
+                    )
                 return
 
         async with self._protocol_lock:
@@ -923,7 +1005,37 @@ class PeerNode:
         """Get connection statistics"""
         proto = self.protocol
         if proto:
-            return proto.get_stats()
+            stats = proto.get_stats()
+            # For relay mode with adapter, sync stats to metrics collector
+            if isinstance(proto, RelayPeerAdapter):
+                for target_id in list(self.metrics.connections.keys()):
+                    self.metrics.update_stream_stats(target_id, stats)
+            return stats
+        # Listener-side relay: build stats from metrics collector
+        if self.using_relay and self.relay_target_peer_id:
+            conn = self.metrics.get_connection(self.relay_target_peer_id)
+            if conn:
+                avg_rtt = (sum(self._relay_rtt_samples) / len(self._relay_rtt_samples)) if self._relay_rtt_samples else 0.0
+                return {
+                    0: {
+                        'bytes_sent': 0, 'bytes_received': 0,
+                        'messages_sent': 0, 'messages_received': 0,
+                        'last_rtt_ms': self._relay_last_rtt_ms,
+                        'avg_rtt_ms': avg_rtt,
+                        'is_relay': True
+                    },
+                    4: {
+                        'bytes_sent': conn.stream_stats.get(4, {}).get('bytes_sent', 0) if conn.stream_stats else conn.total_bytes_sent,
+                        'bytes_received': conn.stream_stats.get(4, {}).get('bytes_received', 0) if conn.stream_stats else conn.total_bytes_received,
+                        'messages_sent': 0, 'messages_received': 0,
+                        'is_relay': True
+                    },
+                    8: {
+                        'bytes_sent': 0, 'bytes_received': 0,
+                        'messages_sent': 0, 'messages_received': 0,
+                        'disabled': True, 'reason': 'File transfer disabled in relay mode'
+                    }
+                }
         return {}
     
     async def stop(self):
