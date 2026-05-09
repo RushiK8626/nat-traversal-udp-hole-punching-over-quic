@@ -195,6 +195,12 @@ class PeerNode:
         return None
 
     async def _ensure_local_socket(self, preferred_port: Optional[int] = None) -> None:
+        """Ensure a valid UDP socket is bound to preferred_port if possible.
+        
+        On Windows, UDP sockets can enter TIME_WAIT after QUIC closes them, preventing
+        immediate rebind. This method retries with delays to wait for TIME_WAIT to clear.
+        If preferred_port is exhausted, falls back to ephemeral allocation.
+        """
         async with self._socket_lock:
             if self.local_socket is not None:
                 try:
@@ -208,22 +214,50 @@ class PeerNode:
 
             bind_port = preferred_port if preferred_port is not None else self.local_port
 
-            for attempt in range(3):
-                try:
-                    self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                    self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                    self.local_socket.bind(('0.0.0.0', bind_port or 0))
-                    self.local_socket.setblocking(False)
-                    self.local_port = self.local_socket.getsockname()[1]
-                    logger.info(f"Rebound local UDP socket on port: {self.local_port}")
-                    return
-                except OSError as e:
-                    logger.warning(f"Socket bind failed (attempt {attempt+1}): {e}")
-                    self.local_socket = None
-                    bind_port = 0  # fall back to ephemeral on retry
-                    await asyncio.sleep(0.5)
+            # Phase 1: Try preferred port with retries (TIME_WAIT may clear)
+            if bind_port != 0:
+                for attempt in range(5):
+                    try:
+                        self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                        self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                        if hasattr(socket, 'SO_REUSEPORT'):
+                            try:
+                                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                            except OSError:
+                                pass
+                        self.local_socket.bind(('0.0.0.0', bind_port))
+                        self.local_socket.setblocking(False)
+                        self.local_port = self.local_socket.getsockname()[1]
+                        logger.info(f"Rebound local UDP socket on port: {self.local_port}")
+                        return
+                    except OSError as e:
+                        self.local_socket.close()
+                        self.local_socket = None
+                        # WinError 10013 = port in TIME_WAIT after recent close
+                        is_busy = "10013" in str(e) or "EADDRINUSE" in str(e)
+                        if is_busy:
+                            logger.warning(f"Port {bind_port} in use/TIME_WAIT (attempt {attempt+1}/5), retrying in 1s...")
+                            await asyncio.sleep(1.0)
+                        else:
+                            logger.warning(f"Socket bind to port {bind_port} failed: {e}")
+                            break  # Non-retryable error, skip to ephemeral
 
-            raise OSError(f"Failed to bind UDP socket after retries")
+                logger.info(f"Preferred port {bind_port} unavailable after retries, using ephemeral")
+
+            # Phase 2: Ephemeral port fallback
+            try:
+                self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+                self.local_socket.bind(('0.0.0.0', 0))
+                self.local_socket.setblocking(False)
+                self.local_port = self.local_socket.getsockname()[1]
+                logger.info(f"Bound local UDP socket on ephemeral port: {self.local_port}")
+                return
+            except OSError as e:
+                if self.local_socket:
+                    self.local_socket.close()
+                    self.local_socket = None
+                raise OSError(f"Failed to bind UDP socket (even ephemeral): {e}")
     
     def _get_local_ip(self) -> str:
         """Get the local/private IP address (LAN IP, not public)"""
@@ -586,7 +620,8 @@ class PeerNode:
                     self.protocol = await asyncio.wait_for(
                         self._quic_peer.connect(
                             peer_addr[0], peer_addr[1],
-                            local_port=self.local_port  # Reuse hole-punched port
+                            local_port=self.local_port,  # Reuse hole-punched port
+                            target_peer_id=target_peer_id  # Pass peer ID for ticket keying
                         ),
                         timeout=5.0  # 5 second timeout for QUIC handshake
                     )
@@ -604,7 +639,7 @@ class PeerNode:
                 return await self._establish_relay(target_peer_id)
             
             connect_time = (time.time() - start_time) * 1000
-            is_0rtt = hasattr(self.protocol, '_quic') and self.protocol._quic.tls._session_resumed
+            is_0rtt = getattr(self.protocol, 'early_data_accepted', False)
             
             logger.info(f"[QUIC] Handshake complete in {connect_time:.1f}ms | 0-RTT={is_0rtt}")
             self.metrics.record_connection_established(target_peer_id, is_0rtt=is_0rtt)
@@ -766,11 +801,28 @@ class PeerNode:
                 logger.error(f"Error in listen_for_connections: {e}")
 
     async def _handle_incoming_connection(self, peer_id: str, actual_addr: str, data: dict, callback=None):
+        # Close previous QUIC server/connection to release the port
+        async with self._quic_lock:
+            old_quic = self._quic_peer
+            self._quic_peer = None
+        if old_quic:
+            logger.info(f"[CLEANUP] Closing previous QUIC connection before new session with {peer_id}")
+            await old_quic.close()
+            # Brief pause for OS to release the socket
+            await asyncio.sleep(0.2)
+
         # Clear stale protocol/relay state from previous session
         async with self._protocol_lock:
             self.protocol = None
         async with self._relay_lock:
             self.using_relay = False
+            self.relay_target_peer_id = None
+        if self.relay_client:
+            try:
+                await self.relay_client.close()
+            except Exception:
+                pass
+            self.relay_client = None
 
         # Start metrics
         self.metrics.start_connection(peer_id)
@@ -829,10 +881,12 @@ class PeerNode:
                     self._quic_peer = None
                     await old.close()
 
+                ticket_store_file = f".session_tickets_{self.peer_id}.pkl"
                 self._quic_peer = QuicPeer(
                     self.peer_id,
                     self.cert_file,
-                    self.key_file
+                    self.key_file,
+                    ticket_store_file=ticket_store_file
                 )
             
             connected_event = asyncio.Event()
