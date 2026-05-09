@@ -12,6 +12,7 @@ NAT Types:
 import asyncio
 import json
 import socket
+import select
 import logging
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -94,27 +95,17 @@ class NATClassifier:
         return None
     
     async def _recv_with_select(self, sock: socket.socket, bufsize: int) -> bytes:
-        """Receive data using event loop reader (cross-platform, no busy-poll)"""
-        loop = asyncio.get_event_loop()
-        future = loop.create_future()
+        """Receive data using select so it works on native Windows event loops."""
+        loop = asyncio.get_running_loop()
 
-        def on_readable():
-            try:
-                data, _ = sock.recvfrom(bufsize)
-                if not future.done():
-                    future.set_result(data)
-            except Exception as e:
-                if not future.done():
-                    future.set_exception(e)
-            finally:
-                loop.remove_reader(sock.fileno())  
+        def _blocking_recv() -> bytes:
+            ready, _, _ = select.select([sock], [], [], self.timeout)
+            if not ready:
+                raise asyncio.TimeoutError()
+            data, _ = sock.recvfrom(bufsize)
+            return data
 
-        loop.add_reader(sock.fileno(), on_readable)
-        try:
-            return await future
-        except asyncio.CancelledError:
-            loop.remove_reader(sock.fileno())  # cleanup on timeout/cancel
-            raise
+        return await loop.run_in_executor(None, _blocking_recv)
 
     async def classify(self, peer_id: str, local_port: int = 0) -> Optional[NATClassificationResult]:
         """
