@@ -181,6 +181,10 @@ class HolePuncher:
                 data, addr = self.sock.recvfrom(4096)
             except BlockingIOError:
                 return  # spurious wakeup, re-arm happens automatically
+            except (OSError, ConnectionResetError) as e:
+                # On Windows, ICMP port unreachable comes as ConnectionResetError
+                logger.debug(f"Socket error during punch receive: {e}")
+                return
             except Exception as e:
                 if not future.done():
                     future.set_exception(e)
@@ -236,12 +240,48 @@ class HolePuncher:
             logger.debug("add_reader not supported, falling back to polling-based reception")
             # Fallback: polling-based receive
             async def polling_receive():
+                nonlocal punch_count
                 while not future.done():
                     try:
                         data, addr = self.sock.recvfrom(4096)
-                        on_readable()  # Process the data via the same handler
+                        # Process the data manually
+                        is_punch, parsed = self._is_punch_packet(data)
+                        if not is_punch:
+                            logger.debug(f"Non-punch data from {addr}: {data[:50]}")
+                            continue
+
+                        punch_count += 1
+                        received_from.add(addr[0])
+                        if punch_count == 1 or punch_count % 5 == 0:
+                            logger.info(f"Received punch #{punch_count} from {addr}, peer_id={parsed.get('peer_id')}")
+
+                        if (parsed.get('peer_id') == self.expected_peer_id and
+                                addr[0] == expected_addr[0]):
+                            self._peer_confirmed_addr = addr
+                            self._punch_received.set()
+                            if not future.done():
+                                future.set_result(addr)
+
+                            # Send confirmations
+                            confirm = json.dumps({
+                                'magic': PUNCH_MAGIC.decode(),
+                                'peer_id': self.peer_id,
+                                'type': 'confirm',
+                                'ts': time.time()
+                            }).encode()
+                            for _ in range(3):
+                                try:
+                                    self.sock.sendto(confirm, addr)
+                                except Exception:
+                                    pass
+                            logger.info(f"Hole punch confirmed with {addr} ({punch_count} punches total)")
+                            return
                     except BlockingIOError:
                         await asyncio.sleep(0.001)  # Small delay between polls
+                    except (OSError, ConnectionResetError) as e:
+                        # On Windows, ICMP port unreachable comes as ConnectionResetError
+                        logger.debug(f"Socket error during polling: {e}")
+                        await asyncio.sleep(0.001)
                     except Exception as e:
                         if not future.done():
                             future.set_exception(e)
@@ -284,10 +324,9 @@ class BidirectionalHolePuncher:
     def __init__(self, local_socket: socket.socket, peer_id: str):
         self.sock = local_socket
         self.peer_id = peer_id
-        self.puncher = HolePuncher(local_socket, peer_id)
     
     async def execute(self, target_addr: Tuple[str, int], 
-                      my_nat_type: str, peer_nat_type: str) -> HolePunchResult:
+                      my_nat_type: str, peer_nat_type: str, target_peer_id: str = None) -> HolePunchResult:
         """
         Execute hole punching with strategy based on NAT types.
         
@@ -310,15 +349,16 @@ class BidirectionalHolePuncher:
         if my_nat_type == 'symmetric' or peer_nat_type == 'symmetric':
             # One symmetric NAT - might work with more attempts
             logger.info("One peer has symmetric NAT - using extended retry")
-            return await self._extended_punch(target_addr)
+            return await self._extended_punch(target_addr, target_peer_id)
         else:
             # Both non-symmetric - standard approach
-            return await self.puncher.punch(target_addr)
+            puncher = HolePuncher(self.sock, self.peer_id, expected_peer_id=target_peer_id)
+            return await puncher.punch(target_addr)
     
-    async def _extended_punch(self, target_addr: Tuple[str, int]) -> HolePunchResult:
+    async def _extended_punch(self, target_addr: Tuple[str, int], target_peer_id: str = None) -> HolePunchResult:
         """Extended hole punch with more attempts for difficult NAT situations"""
         # Use more aggressive retry
-        original_puncher = HolePuncher(self.sock, self.peer_id)
+        original_puncher = HolePuncher(self.sock, self.peer_id, expected_peer_id=target_peer_id)
         
         # Try primary address
         result = await original_puncher.punch(target_addr)
@@ -330,7 +370,7 @@ class BidirectionalHolePuncher:
             varied_addr = (target_addr[0], target_addr[1] + port_offset)
             logger.info(f"Trying port variation: {varied_addr}")
             
-            puncher = HolePuncher(self.sock, self.peer_id)
+            puncher = HolePuncher(self.sock, self.peer_id, expected_peer_id=target_peer_id)
             result = await puncher.punch(varied_addr)
             if result.success:
                 return result

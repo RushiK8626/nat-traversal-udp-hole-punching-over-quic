@@ -545,7 +545,7 @@ class PeerNode:
         my_nat = self.nat_result.nat_type if self.nat_result else 'unknown'
         puncher = BidirectionalHolePuncher(self.local_socket, self.peer_id)
         
-        return await puncher.execute(peer_addr, my_nat, peer_nat_type)
+        return await puncher.execute(peer_addr, my_nat, peer_nat_type, target_peer_id=target_peer_id)
     
     async def _establish_quic(self, target_peer_id: str, peer_addr: Tuple[str, int]) -> bool:
         """Establish QUIC connection after successful hole punch"""
