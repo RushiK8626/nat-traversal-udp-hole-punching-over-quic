@@ -149,7 +149,7 @@ class PeerNode:
             # Track receive stats on the metrics collector
             target = source_peer or self.relay_target_peer_id
             if target:
-                self.metrics.record_bytes(target, stream_id=4, received=len(payload))
+                self.metrics.record_bytes(target, stream_id=4, received=len(payload), msgs_received=1 if msg_type == 'chat' else 0)
 
             if msg_type == 'chat' and self.on_chat_message:
                 self.on_chat_message(msg.get('from', source_peer), msg.get('text', ''))
@@ -677,6 +677,9 @@ class PeerNode:
             logger.debug(f"[METRICS] Starting RTT ping loop...")
             await self.metrics.start_ping_loop(target_peer_id, self.protocol, interval=5.0)
             
+            # Start periodic stats sync to metrics collector
+            asyncio.create_task(self._sync_stats_loop(target_peer_id))
+            
             # Notify server of success (with reconnect if needed)
             try:
                 async with self._ws_lock:
@@ -747,8 +750,8 @@ class PeerNode:
         # Start ping loop for RTT monitoring (same as QUIC mode)
         await self.metrics.start_ping_loop(target_peer_id, adapter, interval=5.0)
         
-        # Start periodic relay stats sync to metrics collector
-        asyncio.create_task(self._relay_stats_loop(target_peer_id))
+        # Start periodic stats sync to metrics collector
+        asyncio.create_task(self._sync_stats_loop(target_peer_id))
         
         if self.on_connected:
             self.on_connected(target_peer_id, True)  # Using relay
@@ -756,22 +759,22 @@ class PeerNode:
         logger.info(f"[CONN] Connected to {target_peer_id} (Relay/WebSocket fallback)")
         return True
     
-    async def _relay_stats_loop(self, target_peer_id: str):
-        """Periodically sync relay adapter stats into the metrics collector."""
+    async def _sync_stats_loop(self, target_peer_id: str):
+        """Periodically sync protocol stats into the metrics collector."""
         try:
             while True:
                 await asyncio.sleep(5.0)
                 async with self._protocol_lock:
                     proto = self.protocol
-                if proto and isinstance(proto, RelayPeerAdapter):
+                if proto:
                     stats = proto.get_stats()
                     self.metrics.update_stream_stats(target_peer_id, stats)
-                elif not self.using_relay:
-                    break  # No longer in relay mode
+                else:
+                    break  # No longer active
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            logger.debug(f"Relay stats loop ended: {e}")
+            logger.debug(f"Stats sync loop ended: {e}")
     
     async def _relay_ping_loop(self, target_peer_id: str, interval: float = 5.0):
         """Periodic ping loop for listener-side relay RTT measurement via signalling websocket."""
@@ -859,6 +862,13 @@ class PeerNode:
                     # Start metrics tracking for the listener-side relay
                     if initiator:
                         self.metrics.start_connection(initiator)
+                        if self.nat_result:
+                            self.metrics.record_nat_classification(
+                                initiator,
+                                self.nat_result.nat_type,
+                                self.nat_result.confidence,
+                                self.nat_result.mapped_addr_1
+                            )
                         self.metrics.record_relay_fallback(initiator, session_id or '')
                         self.metrics.record_connection_established(initiator)
                         # Start RTT ping loop for listener-side relay
@@ -903,6 +913,13 @@ class PeerNode:
 
         # Start metrics
         self.metrics.start_connection(peer_id)
+        if self.nat_result:
+            self.metrics.record_nat_classification(
+                peer_id,
+                self.nat_result.nat_type,
+                self.nat_result.confidence,
+                self.nat_result.mapped_addr_1
+            )
         
         # Wait for synchronized punch start time if provided
         punch_start_time = data.get('punch_start_time')
@@ -998,6 +1015,9 @@ class PeerNode:
             self.metrics.record_connection_established(expected_peer_id)
             await self.metrics.start_ping_loop(expected_peer_id, self.protocol, interval=5.0)
             
+            # Start periodic stats sync to metrics collector
+            asyncio.create_task(self._sync_stats_loop(expected_peer_id))
+            
             if self.on_connected:
                 self.on_connected(expected_peer_id, False)
             
@@ -1029,7 +1049,7 @@ class PeerNode:
                 # Track send stats on the metrics collector for listener-side relay
                 if success:
                     self.metrics.record_bytes(
-                        self.relay_target_peer_id, stream_id=4, sent=len(msg)
+                        self.relay_target_peer_id, stream_id=4, sent=len(msg), msgs_sent=1
                     )
                 return
 
@@ -1081,7 +1101,8 @@ class PeerNode:
                     4: {
                         'bytes_sent': conn.stream_stats.get(4, {}).get('bytes_sent', 0) if conn.stream_stats else conn.total_bytes_sent,
                         'bytes_received': conn.stream_stats.get(4, {}).get('bytes_received', 0) if conn.stream_stats else conn.total_bytes_received,
-                        'messages_sent': 0, 'messages_received': 0,
+                        'messages_sent': conn.stream_stats.get(4, {}).get('messages_sent', 0) if conn.stream_stats else conn.total_messages_sent,
+                        'messages_received': conn.stream_stats.get(4, {}).get('messages_received', 0) if conn.stream_stats else conn.total_messages_received,
                         'is_relay': True
                     },
                     8: {
