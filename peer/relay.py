@@ -26,6 +26,8 @@ class RelayStats:
     bytes_received: int = 0
     frames_sent: int = 0
     frames_received: int = 0
+    messages_sent: int = 0
+    messages_received: int = 0
     start_time: float = 0.0
 
 
@@ -149,7 +151,10 @@ class RelayClient:
             'text': text,
             'ts': time.time()
         }).encode()
-        return await self.send(target_peer_id, msg)
+        result = await self.send(target_peer_id, msg)
+        if result:
+            self.stats.messages_sent += 1
+        return result
     
     async def send_control(self, target_peer_id: str, control_type: str, **kwargs):
         """Send control message through relay"""
@@ -183,6 +188,7 @@ class RelayClient:
                     
                     self.stats.bytes_received += len(payload)
                     self.stats.frames_received += 1
+                    self.stats.messages_received += 1
                     
                     if self.on_message:
                         self.on_message(source_peer, payload)
@@ -219,6 +225,8 @@ class RelayClient:
             'bytes_received': self.stats.bytes_received,
             'frames_sent': self.stats.frames_sent,
             'frames_received': self.stats.frames_received,
+            'messages_sent': self.stats.messages_sent,
+            'messages_received': self.stats.messages_received,
             'uptime_seconds': uptime,
             'is_relay': True
         }
@@ -238,6 +246,12 @@ class RelayPeerAdapter:
         self.connected = relay_client.connected
         self.on_chat_message: Optional[Callable[[str, str], None]] = None
         
+        # Ping/RTT tracking
+        self._ping_seq = 0
+        self._ping_times: Dict[int, float] = {}
+        self._last_rtt_ms: float = 0.0
+        self._rtt_samples: list = []
+        
         # Set up message handler
         relay_client.on_message = self._handle_message
     
@@ -252,10 +266,17 @@ class RelayPeerAdapter:
             elif msg.get('type') == 'control':
                 control_type = msg.get('control_type')
                 if control_type == 'ping':
-                    # Send pong back
+                    # Send pong back with the original timestamp
                     asyncio.create_task(self.relay.send_control(
-                        from_peer, 'pong', seq=msg.get('seq')
+                        from_peer, 'pong', seq=msg.get('seq'), ts=msg.get('ts')
                     ))
+                elif control_type == 'pong':
+                    # Resolve a pending ping
+                    seq = msg.get('seq')
+                    if seq is not None and seq in self._ping_times:
+                        rtt_ms = (time.time() - self._ping_times.pop(seq)) * 1000
+                        self._last_rtt_ms = rtt_ms
+                        self._rtt_samples.append(rtt_ms)
         
         except Exception as e:
             logger.error(f"Message handling error: {e}")
@@ -265,29 +286,53 @@ class RelayPeerAdapter:
         asyncio.create_task(self.relay.send_chat(self.target_peer_id, text))
     
     async def send_ping(self) -> Optional[float]:
-        """Send ping (simplified for relay)"""
-        # Relay mode doesn't support precise RTT measurement
-        # Return estimated latency based on message round-trip
+        """Send ping through relay and measure RTT"""
+        self._ping_seq += 1
+        seq = self._ping_seq
+        self._ping_times[seq] = time.time()
+        
+        await self.relay.send_control(
+            self.target_peer_id, 'ping', seq=seq, ts=time.time()
+        )
+        
+        # Wait for pong (with timeout)
+        start = time.time()
+        while seq in self._ping_times and (time.time() - start) < 5.0:
+            await asyncio.sleep(0.01)
+        
+        if seq not in self._ping_times:
+            return self._last_rtt_ms
+        
+        # Timeout - clean up
+        self._ping_times.pop(seq, None)
         return None
     
     def get_stats(self) -> Dict[int, dict]:
         """Get stats in QUIC-like format"""
         relay_stats = self.relay.get_stats()
+        avg_rtt = (sum(self._rtt_samples) / len(self._rtt_samples)) if self._rtt_samples else 0.0
         return {
             0: {  # Control stream
                 'bytes_sent': 0,
                 'bytes_received': 0,
-                'last_rtt_ms': 0,
+                'messages_sent': 0,
+                'messages_received': 0,
+                'last_rtt_ms': self._last_rtt_ms,
+                'avg_rtt_ms': avg_rtt,
                 'is_relay': True
             },
             4: {  # Chat stream
                 'bytes_sent': relay_stats['bytes_sent'],
                 'bytes_received': relay_stats['bytes_received'],
+                'messages_sent': relay_stats['messages_sent'],
+                'messages_received': relay_stats['messages_received'],
                 'is_relay': True
             },
             8: {  # File stream (disabled in relay)
                 'bytes_sent': 0,
                 'bytes_received': 0,
+                'messages_sent': 0,
+                'messages_received': 0,
                 'disabled': True,
                 'reason': 'File transfer disabled in relay mode'
             }
