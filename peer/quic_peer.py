@@ -67,108 +67,181 @@ class TicketEntry:
     
     def is_expired(self) -> bool:
         """Check if ticket is expired"""
-        # Check aioquic ticket expiry
-        if hasattr(self.ticket, 'is_expired') and callable(self.ticket.is_expired):
-            return self.ticket.is_expired()
+        # Use aioquic's is_valid property (checks not_valid_before/after)
+        if hasattr(self.ticket, 'is_valid'):
+            return not self.ticket.is_valid
         
-        # Fallback: check if ticket has expiry_time attribute
-        if hasattr(self.ticket, 'expiry_time'):
-            return time.time() > self.ticket.expiry_time
+        # Fallback: check not_valid_after datetime
+        if hasattr(self.ticket, 'not_valid_after'):
+            import datetime
+            try:
+                from aioquic.tls import utcnow
+                return utcnow() > self.ticket.not_valid_after
+            except ImportError:
+                return datetime.datetime.now(datetime.timezone.utc) > self.ticket.not_valid_after
         
         # Fallback: check age (assume 1 hour expiry)
         return (time.time() - self.created_time) > 3600
 
 
 class SessionTicketStore:
-    """Stores session tickets for 0-RTT resumption with peer tracking"""
+    """Stores session tickets for 0-RTT resumption with dual indexing.
+    
+    Dual-index design:
+    - Client side: tickets keyed by peer_id (e.g. 'alice') so they survive
+      address/port changes between sessions (NAT port reuse delays).
+    - Server side: tickets keyed by raw ticket bytes so the session_ticket_fetcher
+      can look them up when a client presents a ticket for 0-RTT resumption.
+    
+    The server's session_ticket_handler stores tickets by their bytes label,
+    and the session_ticket_fetcher retrieves them by that same label.
+    """
     
     def __init__(self, ticket_file: Optional[str] = None):
-        self.ticket_entries: Dict[Tuple[str, int], TicketEntry] = {}  # {(host, port): TicketEntry}
+        # Client-side index: {peer_id: TicketEntry}
+        self.ticket_entries: Dict[str, TicketEntry] = {}
+        # Server-side index: {ticket_bytes: SessionTicket}
+        # Used by session_ticket_fetcher to look up tickets by their raw bytes
+        self._server_tickets: Dict[bytes, SessionTicket] = {}
         self.ticket_file = ticket_file
         if self.ticket_file:
             logger.info(f"Initializing ticket store with file: {os.path.abspath(self.ticket_file)}")
         if ticket_file and os.path.exists(ticket_file):
             self._load_tickets()
-        else:
-            if ticket_file:
-                logger.debug(f"Ticket file does not exist yet: {ticket_file}")
     
     def add(self, ticket: SessionTicket) -> None:
         """
         Store a session ticket.
         
-        Note: Called as callback from aioquic during handshake.
-        We store with a placeholder address - tickets are retrieved by calling
-        add_for_peer() after successful connection to associate with actual peer.
+        On the CLIENT side: called as callback from aioquic during handshake.
+        We store with a placeholder key "__pending__" temporarily.
+        After connection succeeds, call migrate_pending_to_peer() to
+        associate with actual peer_id.
+        
+        On the SERVER side: called when a new ticket is issued to a client.
+        We store indexed by ticket.ticket (bytes) so the fetcher can find it.
         """
         if ticket is None:
-            logger.debug("Received None ticket")
             return
         
         try:
-            # Store with placeholder - will be overwritten when associated with peer
-            entry = TicketEntry(ticket=ticket, peer_addr=("unknown", 0), created_time=time.time())
-            # Use tuple of peer_addr as key (even though it's "unknown", won't collide)
-            key = ("unknown", 0)
+            # Always index by ticket bytes for server-side fetcher
+            if hasattr(ticket, 'ticket') and ticket.ticket:
+                self._server_tickets[ticket.ticket] = ticket
             
-            self.ticket_entries[key] = entry
-            logger.info(f"Session ticket received from server | Expiry={self._get_expiry_str(entry)} | Stored temporarily")
+            # Also store under placeholder for client-side migration
+            entry = TicketEntry(ticket=ticket, peer_addr=("", 0), created_time=time.time())
+            self.ticket_entries["__pending__"] = entry
             
             if self.ticket_file:
                 self._save_tickets()
         except Exception as e:
-            logger.error(f"Failed to add ticket: {e}")
+            logger.error(f"[TICKET] Failed to add ticket: {e}", exc_info=True)
 
-    def add_for_peer(self, ticket: SessionTicket, peer_addr: Tuple[str, int]) -> None:
+    def add_for_peer(self, ticket: SessionTicket, peer_id: str) -> None:
         """
         Store a session ticket associated with a specific peer.
-        Call this AFTER successful connection to associate ticket with peer.
+        Call this AFTER successful connection to associate ticket with peer_id.
+        
+        Args:
+            ticket: The session ticket from server
+            peer_id: The peer identifier (e.g. 'alice')
         """
-        if ticket is None or not peer_addr:
+        if ticket is None or not peer_id:
             return
         
         try:
-            entry = TicketEntry(ticket=ticket, peer_addr=peer_addr, created_time=time.time())
-            self.ticket_entries[peer_addr] = entry
+            entry = TicketEntry(ticket=ticket, peer_addr=("", 0), created_time=time.time())
+            self.ticket_entries[peer_id] = entry
             
-            logger.info(f"Session ticket associated with {peer_addr[0]}:{peer_addr[1]} | Total: {len(self.ticket_entries)}")
+            # Also index by ticket bytes for server-side fetcher
+            if hasattr(ticket, 'ticket') and ticket.ticket:
+                self._server_tickets[ticket.ticket] = ticket
             
             if self.ticket_file:
                 self._save_tickets()
         except Exception as e:
-            logger.error(f"Failed to add ticket for peer: {e}")
-    
-    def get_ticket_for_peer(self, peer_addr: Tuple[str, int]) -> Optional[SessionTicket]:
+            logger.error(f"Failed to add ticket for peer {peer_id}: {e}")
+
+    def fetch_by_label(self, label: bytes) -> Optional[SessionTicket]:
         """
-        Retrieve a valid (non-expired) session ticket for a specific peer.
-        Returns the ticket if found and valid, None otherwise.
+        Retrieve a session ticket by its raw ticket bytes.
+        This is used as the server-side session_ticket_fetcher callback.
+        
+        Args:
+            label: The ticket bytes presented by the client
+            
+        Returns:
+            SessionTicket if found and valid, None otherwise
         """
-        if peer_addr not in self.ticket_entries:
-            logger.debug(f"No ticket found for {peer_addr[0]}:{peer_addr[1]}")
+        ticket = self._server_tickets.get(label)
+        if ticket is None:
             return None
         
-        entry = self.ticket_entries[peer_addr]
-        
-        if entry.is_expired():
-            logger.info(f"Ticket for {peer_addr[0]}:{peer_addr[1]} is expired, removing")
-            del self.ticket_entries[peer_addr]
+        # Check validity
+        if hasattr(ticket, 'is_valid') and not ticket.is_valid:
+            del self._server_tickets[label]
             if self.ticket_file:
                 self._save_tickets()
             return None
         
-        logger.info(f"Using stored session ticket for 0-RTT with {peer_addr[0]}:{peer_addr[1]}")
+        return ticket
+    
+    def get_ticket_for_peer(self, peer_id: str) -> Optional[SessionTicket]:
+        """
+        Retrieve a valid (non-expired) session ticket for a specific peer.
+        Used on the client side to load a ticket for 0-RTT resumption.
+        
+        Args:
+            peer_id: The peer identifier (e.g. 'alice')
+            
+        Returns:
+            Session ticket if found and valid, None otherwise
+        """
+        if peer_id not in self.ticket_entries:
+            return None
+        
+        entry = self.ticket_entries[peer_id]
+        
+        if entry.is_expired():
+            del self.ticket_entries[peer_id]
+            if self.ticket_file:
+                self._save_tickets()
+            return None
+        
         return entry.ticket
     
-    def pop(self, peer_addr: Tuple[str, int]) -> Optional[SessionTicket]:
+    def migrate_pending_to_peer(self, peer_id: str) -> bool:
+        """
+        Move the '__pending__' placeholder ticket to a peer_id key.
+        Call after successful client connection to associate the ticket
+        with the actual peer identity.
+        
+        Args:
+            peer_id: The peer identifier (e.g. 'alice')
+            
+        Returns:
+            True if migration succeeded, False if no pending ticket
+        """
+        placeholder_entry = self.ticket_entries.pop("__pending__", None)
+        if placeholder_entry is None:
+            return False
+        
+        self.ticket_entries[peer_id] = placeholder_entry
+        
+        if self.ticket_file:
+            self._save_tickets()
+        return True
+    
+    def pop(self, peer_id: str) -> Optional[SessionTicket]:
         """
         Retrieve and remove a session ticket for a peer.
         Use after consuming ticket for 0-RTT.
         """
-        if peer_addr not in self.ticket_entries:
+        if peer_id not in self.ticket_entries:
             return None
         
-        entry = self.ticket_entries.pop(peer_addr)
-        logger.info(f"Removed ticket for {peer_addr[0]}:{peer_addr[1]} after 0-RTT use")
+        entry = self.ticket_entries.pop(peer_id)
         
         if self.ticket_file:
             self._save_tickets()
@@ -179,9 +252,12 @@ class SessionTicketStore:
         """Persist tickets to file using pickle"""
         try:
             import pickle
+            save_data = {
+                'peer_entries': self.ticket_entries,
+                'server_tickets': self._server_tickets,
+            }
             with open(self.ticket_file, 'wb') as f:
-                pickle.dump(self.ticket_entries, f)
-            logger.debug(f"Saved {len(self.ticket_entries)} tickets to {self.ticket_file}")
+                pickle.dump(save_data, f)
         except Exception as e:
             logger.error(f"Failed to save tickets: {e}")
     
@@ -190,39 +266,65 @@ class SessionTicketStore:
         try:
             import pickle
             with open(self.ticket_file, 'rb') as f:
-                loaded_entries = pickle.load(f)
-                self.ticket_entries = loaded_entries
-            logger.info(f"✓ Loaded {len(self.ticket_entries)} session tickets from {os.path.abspath(self.ticket_file)}")
-            for peer_addr, entry in self.ticket_entries.items():
-                logger.info(f"  - Peer {peer_addr[0]}:{peer_addr[1]} | Expires: {self._get_expiry_str(entry)}")
+                loaded = pickle.load(f)
+            
+            # Handle both old format (dict of TicketEntry) and new format (dict with keys)
+            if isinstance(loaded, dict) and 'peer_entries' in loaded:
+                self.ticket_entries = loaded['peer_entries']
+                self._server_tickets = loaded.get('server_tickets', {})
+            else:
+                # Legacy format: plain dict of TicketEntry
+                self.ticket_entries = loaded
+                self._server_tickets = {}
+                # Rebuild server index from peer entries
+                for peer_id, entry in self.ticket_entries.items():
+                    if hasattr(entry.ticket, 'ticket') and entry.ticket.ticket:
+                        self._server_tickets[entry.ticket.ticket] = entry.ticket
+            
+            logger.info(f"Loaded {len(self.ticket_entries)} peer tickets from {os.path.abspath(self.ticket_file)}")
         except Exception as e:
             logger.warning(f"Failed to load tickets: {e}")
             self.ticket_entries = {}
+            self._server_tickets = {}
 
     def _get_expiry_str(self, entry: TicketEntry) -> str:
         """Get human-readable expiry time"""
-        if hasattr(entry.ticket, 'expiry_time'):
-            remaining = entry.ticket.expiry_time - time.time()
+        if hasattr(entry.ticket, 'not_valid_after'):
+            import datetime
+            try:
+                from aioquic.tls import utcnow
+                remaining = (entry.ticket.not_valid_after - utcnow()).total_seconds()
+            except ImportError:
+                remaining = (entry.ticket.not_valid_after - datetime.datetime.now(datetime.timezone.utc)).total_seconds()
             if remaining > 0:
                 return f"{remaining:.0f}s remaining"
+            return "expired"
         return "unknown"
     
     def cleanup_expired(self) -> int:
         """Remove all expired tickets. Returns count of removed tickets."""
         expired_peers = [
-            addr for addr, entry in self.ticket_entries.items()
+            peer_id for peer_id, entry in self.ticket_entries.items()
             if entry.is_expired()
         ]
         
-        for addr in expired_peers:
-            del self.ticket_entries[addr]
+        for peer_id in expired_peers:
+            del self.ticket_entries[peer_id]
         
-        if expired_peers:
-            logger.info(f"Cleaned up {len(expired_peers)} expired tickets")
+        # Also clean up expired server tickets
+        expired_labels = [
+            label for label, ticket in self._server_tickets.items()
+            if hasattr(ticket, 'is_valid') and not ticket.is_valid
+        ]
+        for label in expired_labels:
+            del self._server_tickets[label]
+        
+        total_removed = len(expired_peers) + len(expired_labels)
+        if total_removed:
             if self.ticket_file:
                 self._save_tickets()
         
-        return len(expired_peers)
+        return total_removed
     
 class QuicPeerProtocol(QuicConnectionProtocol):
     """Custom QUIC protocol handling multiple streams"""
@@ -538,7 +640,29 @@ class QuicPeer:
         self.protocol: Optional[QuicPeerProtocol] = None
         self._server = None
         self._connection = None  # Holds the connection context manager
-        self._target_peer_addr: Optional[Tuple[str, int]] = None  # Store target peer address for ticket association
+        self._target_peer_id: Optional[str] = None  # Target peer ID for ticket ops
+        self._target_peer_addr: Optional[Tuple[str, int]] = None  # Store target peer address
+
+    def _fetch_session_ticket(self, label: bytes) -> Optional[SessionTicket]:
+        """Fetcher callback for aioquic to retrieve cached session tickets.
+        
+        Called by aioquic on the SERVER side when a client presents a session
+        ticket for 0-RTT resumption. The `label` parameter is the raw ticket
+        bytes (SessionTicket.ticket field).
+        
+        Looks up the ticket by its bytes label in the server-side index,
+        which is independent of peer_id or address.
+        
+        Args:
+            label: The raw ticket bytes presented by the client
+            
+        Returns:
+            Session ticket object, or None if not available
+        """
+        try:
+            return self.ticket_store.fetch_by_label(label)
+        except Exception:
+            return None
 
     def _create_client_config(self) -> QuicConfiguration:
         """Create QUIC configuration for client mode"""
@@ -552,19 +676,13 @@ class QuicPeer:
         config.load_verify_locations(self.cert_file)
         config.verify_mode = ssl.CERT_REQUIRED
         
-        # Try to load existing session ticket for this peer (for 0-RTT)
-        if self._target_peer_addr:
-            logger.debug(f"Looking for existing ticket for {self._target_peer_addr[0]}:{self._target_peer_addr[1]}")
-            ticket = self.ticket_store.get_ticket_for_peer(self._target_peer_addr)
+        # Try to load existing session ticket for this peer (for 0-RTT resumption)
+        # Tickets are keyed by peer_id, not address, so they survive port changes
+        if self._target_peer_id:
+            ticket = self.ticket_store.get_ticket_for_peer(self._target_peer_id)
             if ticket:
                 config.session_ticket = ticket
-                logger.info(f"✓ Loaded session ticket for 0-RTT to {self._target_peer_addr[0]}:{self._target_peer_addr[1]}")
-            else:
-                logger.debug(f"No existing ticket for {self._target_peer_addr[0]}:{self._target_peer_addr[1]} - will perform full handshake")
         
-        # Enable 0-RTT - callback to store new tickets from server
-        config.session_ticket_handler = self.ticket_store.add
-
         return config
     
     def _create_server_config(self) -> QuicConfiguration:
@@ -575,13 +693,11 @@ class QuicPeer:
         )
         config.load_cert_chain(self.cert_file, self.key_file)
         
-        # Issue session tickets for 0-RTT
-        config.session_ticket_handler = self.ticket_store.add
-        
         return config
     
     async def connect(self, host: str, port: int, 
-                      local_port: Optional[int] = None, auth_token: str = None) -> QuicPeerProtocol:
+                      local_port: Optional[int] = None, auth_token: str = None,
+                      target_peer_id: Optional[str] = None) -> QuicPeerProtocol:
         """
         Connect to a QUIC peer.
         
@@ -590,11 +706,13 @@ class QuicPeer:
             port: Remote port
             local_port: Local port to bind (for hole punching, use same port)
             auth_token: Optional auth token
+            target_peer_id: Peer ID for session ticket keying (e.g. 'alice')
         Returns:
             QuicPeerProtocol instance
         """
 
         peer_addr = (host, port)
+        self._target_peer_id = target_peer_id  # Store for ticket lookups (keyed by peer_id, not address)
         self._target_peer_addr = peer_addr
 
         config = self._create_client_config()
@@ -612,11 +730,13 @@ class QuicPeer:
         
         # Use connect() without context manager to keep connection alive
         # The connection object is stored and must be closed explicitly via close()
+        # Pass handler directly to connect(), not on config
         self._connection = connect(
             host, port,
             configuration=config,
             create_protocol=client_protocol_factory,
-            local_port=local_port or 0
+            local_port=local_port or 0,
+            session_ticket_handler=self.ticket_store.add
         )
         
         self.protocol = await self._connection.__aenter__()
@@ -629,16 +749,14 @@ class QuicPeer:
         
         logger.info(f"Connected in {connect_time:.1f}ms | 0-RTT={is_0rtt}")
         
-        # After successful connection, move ticket from placeholder to peer address
-        if self._target_peer_addr:
-            # Get the placeholder ticket that was stored during handshake
-            placeholder_entry = self.ticket_store.ticket_entries.pop(("unknown", 0), None)
-            if placeholder_entry:
-                self.ticket_store.ticket_entries[self._target_peer_addr] = placeholder_entry
-                placeholder_entry.peer_addr = self._target_peer_addr
-                logger.info(f"Associated session ticket with peer {self._target_peer_addr[0]}:{self._target_peer_addr[1]}")
-                if self.ticket_file:
-                    self.ticket_store._save_tickets()
+        # Give server time to send post-handshake session ticket frames
+        # Session tickets are sent asynchronously after handshake completes
+        await asyncio.sleep(0.5)
+        
+        # After successful connection, migrate pending ticket to peer_id
+        # This makes the ticket available for future 0-RTT connections to the same peer
+        if self._target_peer_id:
+            self.ticket_store.migrate_pending_to_peer(self._target_peer_id)
         
         # Cleanup expired tickets
         self.ticket_store.cleanup_expired()
@@ -666,10 +784,15 @@ class QuicPeer:
                 asyncio.create_task(self._wait_and_notify(protocol, on_connection))
             return protocol
         
+        # Pass callbacks directly to serve()
+        # session_ticket_fetcher allows server to retrieve cached tickets for resumption
+        # session_ticket_handler stores newly issued tickets
         self._server = await serve(
             host, port,
             configuration=config,
-            create_protocol=protocol_factory
+            create_protocol=protocol_factory,
+            session_ticket_handler=self.ticket_store.add,
+            session_ticket_fetcher=self._fetch_session_ticket
         )
         
         return self._server
