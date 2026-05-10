@@ -4,7 +4,7 @@ import logging
 import time
 from typing import Optional
 
-from peer.relay import RelayPeerAdapter
+from peer.connection.relay import RelayPeerAdapter
 
 logger = logging.getLogger('stats_manager')
 

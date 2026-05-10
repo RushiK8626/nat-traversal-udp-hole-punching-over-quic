@@ -5,9 +5,9 @@ import socket
 import time
 from typing import Optional, Tuple
 
-from peer.hole_punch import BidirectionalHolePuncher, HolePunchResult
-from peer.quic_peer import QuicPeer, QuicPeerProtocol
-from peer.relay import RelayClient, RelayPeerAdapter
+from peer.connection.hole_punch import BidirectionalHolePuncher, HolePunchResult
+from peer.connection.quic_peer import QuicPeer, QuicPeerProtocol
+from peer.connection.relay import RelayClient, RelayPeerAdapter
 
 logger = logging.getLogger('connection_manager')
 

@@ -12,19 +12,18 @@ import uuid
 import websockets
 from pathlib import Path
 from typing import Optional, Tuple
-from peer.signaling import SignalingManager
-from peer.stats import StatManager
-from peer.connection_manager import ConnectionManager
+from peer.signaling.signaling import SignalingManager
+from peer.metrics.stats import StatManager
+from peer.connection.connection_manager import ConnectionManager
 
 # Add parent directory to path to allow imports when running as script
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from peer.nat_classifier import NATClassifier, NATClassificationResult
-from peer.hole_punch import BidirectionalHolePuncher, HolePunchResult
-from peer.quic_peer import QuicPeer, QuicPeerProtocol
-from peer.relay import RelayClient, RelayPeerAdapter
-from peer.metrics import MetricsCollector, MetricsServer
-from peer.cli import run as run_cli
+from peer.hole_punch.nat_classifier import NATClassifier, NATClassificationResult
+from peer.connection.hole_punch import BidirectionalHolePuncher, HolePunchResult
+from peer.connection.quic_peer import QuicPeer, QuicPeerProtocol
+from peer.connection.relay import RelayClient, RelayPeerAdapter
+from peer.metrics.metrics import MetricsCollector, MetricsServer
 from common.auth import TokenAuthClient, ConnectionToken
 logging.basicConfig(
     level=logging.INFO,
@@ -47,7 +46,7 @@ class PeerNode:
         self.metrics_port = metrics_port
         
         # Certificate paths
-        base_dir = Path(__file__).parent.parent / 'certs'
+        base_dir = Path(__file__).parent.parent.parent / 'certs'
         self.cert_file = cert_file or str(base_dir / 'cert.pem')
         self.key_file = key_file or str(base_dir / 'key.pem')
 
@@ -66,7 +65,7 @@ class PeerNode:
         if not os.path.exists(self.cert_file):
             logger.info("Generating self-signed certificate...")
             os.makedirs(base_dir, exist_ok=True)
-            from scripts.gen_certs import generate_certificate
+            from common.gen_certs import generate_certificate
             generate_certificate(
                 cert_file=self.cert_file,
                 key_file=self.key_file,
@@ -620,10 +619,3 @@ class PeerNode:
         # Stop the signaling manager
         logger.info("[SHUTDOWN] Stopping signaling manager...")
         await self.signaling_manager.stop()
-
-if __name__ == '__main__':
-    # On Windows, use SelectorEventLoop to support add_reader() on raw sockets
-    if sys.platform == 'win32':
-        asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
-    
-    asyncio.run(run_cli())

@@ -20,35 +20,22 @@ A minimal NAT traversal implementation using UDP hole punching with QUIC transpo
 
 ```
 nat-traversal-udp-hole-punching-over-quic/
-├── server/
-│   ├── rendezvous.py      # STUN probes + WebSocket signaling + tokens
-│   ├── Dockerfile
-│   └── requirements.txt
-├── peer/                  # Organized by functionality
-│   ├── cli/
-│   │   └── cli.py         # Command-line interface logic
-│   ├── connection/
-│   │   ├── connection_manager.py  # Connection management utilities
-│   │   ├── quic_peer.py           # QUIC with aioquic + 0-RTT
-│   │   └── relay.py               # WebSocket relay fallback
-│   ├── hole_punch/
-│   │   ├── hole_punch.py         # UDP hole punching logic
-│   │   └── nat_classifier.py     # NAT type detection
-│   ├── signaling/
-│   │   └── signaling.py          # Signaling server/client logic
-│   ├── metrics/
-│   │   └── metrics.py            # Metrics collection + HTTP endpoint
-│   ├── stats/
-│   │   └── stats.py              # Statistics handling
-│   ├── Dockerfile
-│   ├── requirements.txt
-│   └── main.py                   # Main orchestrator + entry point
-├── common/
-│   └── auth.py            # Token authentication module
-├── certs/                 # TLS certificates (generated)
-├── scripts/
-│   └── gen_certs.py       # Certificate generation
-├── docker-compose.yml     # Docker Compose configuration
+├── src/                   # Source code
+│   ├── peer/             # Peer node components
+│   │   ├── cli/          # Command-line interface logic
+│   │   ├── connection/   # QUIC, Relay, and Connection Manager
+│   │   ├── hole_punch/   # NAT detection and UDP hole punching
+│   │   ├── metrics/      # Metrics and HTTP server
+│   │   ├── signaling/    # Signaling client
+│   │   └── peer.py       # Main PeerNode orchestrator
+│   ├── server/           # Rendezvous server components
+│   │   └── rendezvous.py # STUN + Signaling logic
+│   └── common/           # Shared utilities (auth, etc.)
+├── run_peer.py           # Top-level entry point for Peer
+├── run_server.py         # Top-level entry point for Server
+├── certs/                # TLS certificates (generated)
+├── scripts/              # Helper scripts (cert generation)
+├── docker-compose.yml    # Docker configuration
 └── README.md
 ```
 
@@ -63,7 +50,6 @@ The `peer/` folder is organized into logical modules for better maintainability:
 | `hole_punch/` | NAT detection and UDP hole punching implementation |
 | `signaling/` | Rendezvous server communication and peer discovery |
 | `metrics/` | Metrics collection and HTTP endpoint for monitoring |
-| `stats/` | Statistics tracking and reporting |
 
 This modular structure allows for:
 - **Easy navigation**: Related functionality grouped together
@@ -83,7 +69,7 @@ python scripts/gen_certs.py
 ### Start Rendezvous Server:
 
 ```bash
-python server/rendezvous.py --host 0.0.0.0
+python run_server.py --host 0.0.0.0
 ```
 
 Server listens on:
@@ -94,13 +80,13 @@ Server listens on:
 ### Start Peer A (Listener):
 
 ```bash
-python peer/main.py --server <server_ip> --peer-id A --metrics-port 9090
+python run_peer.py --server <server_ip> --peer-id A --metrics-port 9090
 ```
 
 ### Start Peer B (Connector):
 
 ```bash
-python peer/main.py --server <server_ip> --peer-id B --connect A --metrics-port 9091
+python run_peer.py --server <server_ip> --peer-id B --connect A --metrics-port 9091
 ```
 
 ### Local usage commands (inside peer prompt)
@@ -150,7 +136,7 @@ File transfer works only in direct QUIC mode.
 ### Command Line Options
 
 ```bash
-python peer/main.py [OPTIONS]
+python run_peer.py [OPTIONS]
 
 Options:
   --peer-id TEXT       Unique peer identifier (default: random)
@@ -230,13 +216,13 @@ To test with actual NAT:
 1. **Deploy server to VPS**
    ```bash
    ssh user@vps.example.com
-   python3 server/rendezvous.py --host 0.0.0.0 --ws-port 8765
+   python3 run_server.py --host 0.0.0.0 --ws-port 8765
    ```
 
 2. **Run peers behind different NATs**
    ```bash
-   python3 peer/main.py --server vps.example.com --peer-id alice
-   python3 peer/main.py --server vps.example.com --peer-id bob --connect alice
+   python3 run_peer.py --server vps.example.com --peer-id alice
+   python3 run_peer.py --server vps.example.com --peer-id bob --connect alice
    ```
 
 3. **Observe results**

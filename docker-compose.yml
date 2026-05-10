@@ -2,10 +2,10 @@ services:
   rendezvous:
     build:
       context: .
-      dockerfile: server/Dockerfile
+      dockerfile: src/server/Dockerfile
     image: rendezvous:v1
     container_name: rendezvous
-    command: python server/rendezvous.py --host 0.0.0.0
+    command: python run_server.py --host 0.0.0.0
     ports:
       - "3478:3478/udp"
       - "3479:3479/udp"
@@ -24,7 +24,7 @@ services:
   x-peer: &peer-base
     build:
       context: .
-      dockerfile: peer/Dockerfile
+      dockerfile: src/peer/Dockerfile
     image: peer:v1          # single shared image tag
     depends_on:
       rendezvous:
@@ -35,7 +35,7 @@ services:
   alice:
     <<: *peer-base
     container_name: alice
-    command: python peer/main.py --server rendezvous --peer-id alice
+    command: python run_peer.py --server rendezvous --peer-id alice
     networks:
       - net_alice
     volumes:
@@ -44,7 +44,7 @@ services:
   bob:
     <<: *peer-base
     container_name: bob
-    command: python peer/main.py --server rendezvous --peer-id bob --connect alice
+    command: python run_peer.py --server rendezvous --peer-id bob --connect alice
     networks:
       - net_bob
     volumes:

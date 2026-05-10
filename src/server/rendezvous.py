@@ -501,9 +501,9 @@ async def main():
     import argparse
     parser = argparse.ArgumentParser(description='NAT Traversal Rendezvous Server')
     parser.add_argument('--host', default='0.0.0.0', help='Bind address')
-    parser.add_argument('--ws-port', type=int, default=WS_PORT, help='WebSocket port')
-    parser.add_argument('--stun-port-1', type=int, default=STUN_PORT_1, help='First STUN port')
-    parser.add_argument('--stun-port-2', type=int, default=STUN_PORT_2, help='Second STUN port')
+    parser.add_argument('--ws-port', type=int, default=8765, help='WebSocket port')
+    parser.add_argument('--stun-port-1', type=int, default=3478, help='First STUN port')
+    parser.add_argument('--stun-port-2', type=int, default=3479, help='Second STUN port')
     args = parser.parse_args()
     
     server = RendezvousServer(
@@ -514,6 +514,3 @@ async def main():
     )
     await server.start()
 
-
-if __name__ == '__main__':
-    asyncio.run(main())

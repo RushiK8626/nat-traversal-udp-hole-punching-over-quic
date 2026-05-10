@@ -382,35 +382,3 @@ class BidirectionalHolePuncher:
             error="Extended hole punch failed"
         )
 
-
-async def main():
-    """Test hole punching (requires coordination with another peer)"""
-    import argparse
-    parser = argparse.ArgumentParser(description='UDP Hole Punch Test')
-    parser.add_argument('--peer-id', required=True, help='This peer ID')
-    parser.add_argument('--target-ip', required=True, help='Target peer IP')
-    parser.add_argument('--target-port', type=int, required=True, help='Target peer port')
-    parser.add_argument('--local-port', type=int, default=0, help='Local port to bind')
-    args = parser.parse_args()
-    
-    # Create socket
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.bind(('0.0.0.0', args.local_port))
-    print(f"Bound to local port: {sock.getsockname()[1]}")
-    
-    puncher = HolePuncher(sock, args.peer_id)
-    result = await puncher.punch((args.target_ip, args.target_port))
-    
-    print(f"\nResult: {'SUCCESS' if result.success else 'FAILED'}")
-    print(f"Time: {result.time_taken_ms:.0f}ms")
-    print(f"Attempts: {result.attempts}")
-    if result.peer_addr:
-        print(f"Peer addr: {result.peer_addr}")
-    if result.error:
-        print(f"Error: {result.error}")
-    
-    sock.close()
-
-
-if __name__ == '__main__':
-    asyncio.run(main())

@@ -245,30 +245,3 @@ class NATClassifier:
 
         return self._classify_from_mappings(mapped_1, mapped_2, local_port)
 
-
-async def main():
-    """Test NAT classification"""
-    import argparse
-    parser = argparse.ArgumentParser(description='NAT Type Classifier')
-    parser.add_argument('--server', required=True, help='Rendezvous server address')
-    parser.add_argument('--stun-port-1', type=int, default=3478, help='First STUN port')
-    parser.add_argument('--stun-port-2', type=int, default=3479, help='Second STUN port')
-    parser.add_argument('--peer-id', default='test-peer', help='Peer ID for probing')
-    args = parser.parse_args()
-    
-    classifier = NATClassifier(
-        server_host=args.server,
-        stun_port_1=args.stun_port_1,
-        stun_port_2=args.stun_port_2
-    )
-    
-    result = await classifier.classify(args.peer_id)
-    if result:
-        print(f"\nNAT Type: {result.nat_type}")
-        print(f"Confidence: {result.confidence}")
-        print(f"Can hole punch: {result.can_hole_punch()}")
-        print(f"Mapped addresses: {result.mapped_addr_1}, {result.mapped_addr_2}")
-
-
-if __name__ == '__main__':
-    asyncio.run(main())

@@ -8,7 +8,7 @@ from pathlib import Path
 from typing import Optional, TYPE_CHECKING, Tuple
 
 if TYPE_CHECKING:
-    from peer.main import PeerNode
+    from peer.peer import PeerNode
 
 async def interactive_mode(node: 'PeerNode', target_peer_id: str = None):
     """Interactive chat mode"""
@@ -158,7 +158,7 @@ def print_formatted_stats(stats: dict):
 
 
 async def run():
-    from peer.main import PeerNode
+    from peer.peer import PeerNode
     
     parser = argparse.ArgumentParser(description='NAT Traversal Peer')
     parser.add_argument('--peer-id', default=f'peer-{uuid.uuid4().hex[:6]}',
