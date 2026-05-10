@@ -21,21 +21,55 @@ A minimal NAT traversal implementation using UDP hole punching with QUIC transpo
 ```
 nat-traversal-udp-hole-punching-over-quic/
 ├── server/
-│   └── rendezvous.py      # STUN probes + WebSocket signaling + tokens
-├── peer/
-│   ├── nat_classifier.py  # NAT type detection
-│   ├── hole_punch.py      # UDP hole punching logic
-│   ├── quic_peer.py       # QUIC with aioquic + 0-RTT
-│   ├── relay.py           # WebSocket relay fallback
-│   ├── metrics.py         # Metrics collection + HTTP endpoint
-│   └── main.py            # Main orchestrator
+│   ├── rendezvous.py      # STUN probes + WebSocket signaling + tokens
+│   ├── Dockerfile
+│   └── requirements.txt
+├── peer/                  # Organized by functionality
+│   ├── cli/
+│   │   └── cli.py         # Command-line interface logic
+│   ├── connection/
+│   │   ├── connection_manager.py  # Connection management utilities
+│   │   ├── quic_peer.py           # QUIC with aioquic + 0-RTT
+│   │   └── relay.py               # WebSocket relay fallback
+│   ├── hole_punch/
+│   │   ├── hole_punch.py         # UDP hole punching logic
+│   │   └── nat_classifier.py     # NAT type detection
+│   ├── signaling/
+│   │   └── signaling.py          # Signaling server/client logic
+│   ├── metrics/
+│   │   └── metrics.py            # Metrics collection + HTTP endpoint
+│   ├── stats/
+│   │   └── stats.py              # Statistics handling
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── main.py                   # Main orchestrator + entry point
 ├── common/
 │   └── auth.py            # Token authentication module
 ├── certs/                 # TLS certificates (generated)
 ├── scripts/
 │   └── gen_certs.py       # Certificate generation
-└── requirements.txt
+├── docker-compose.yml     # Docker Compose configuration
+└── README.md
 ```
+
+### Peer Module Organization
+
+The `peer/` folder is organized into logical modules for better maintainability:
+
+| Module | Purpose |
+|--------|---------|
+| `cli/` | Command-line interface and argument parsing |
+| `connection/` | Connection management, QUIC communication, and relay fallback |
+| `hole_punch/` | NAT detection and UDP hole punching implementation |
+| `signaling/` | Rendezvous server communication and peer discovery |
+| `metrics/` | Metrics collection and HTTP endpoint for monitoring |
+| `stats/` | Statistics tracking and reporting |
+
+This modular structure allows for:
+- **Easy navigation**: Related functionality grouped together
+- **Scalability**: Simple to add new features without cluttering the root
+- **Testing**: Each module can be tested independently
+- **Reusability**: Modules can be imported and used in other projects
 
 ## Setup
 

@@ -49,23 +49,33 @@ class NATClassifier:
         self.extended_retries = retries + 3  
     
     async def probe_port(self, sock: socket.socket, peer_id: str, 
-                         server_port: int) -> Optional[Tuple[str, int]]:
-        """Send probe to one server port and get mapped address back"""
-        loop = asyncio.get_event_loop()
+                         server_port: int, retries: int = None,
+                         retry_delay: float = 0.1) -> Optional[Tuple[str, int]]:
+        """Send probe to one server port and get mapped address back.
+        
+        Args:
+            sock: UDP socket to send from
+            peer_id: Peer identifier for the probe
+            server_port: Target STUN server port
+            retries: Number of retry attempts (defaults to self.retries)
+            retry_delay: Delay between retries in seconds
+        """
+        if retries is None:
+            retries = self.retries
         
         probe = json.dumps({
             'type': 'probe',
             'peer_id': peer_id
         }).encode()
         
-        for attempt in range(self.retries):
+        for attempt in range(retries):
             try:
                 # Ensure socket is in non-blocking mode for asyncio
                 sock.setblocking(False)
                 
                 # Send probe directly using sendto (thread-safe for UDP)
                 sock.sendto(probe, (self.server_host, server_port))
-                logger.debug(f"Sent probe to {self.server_host}:{server_port} (attempt {attempt + 1})")
+                logger.debug(f"Sent probe to {self.server_host}:{server_port} (attempt {attempt + 1}/{retries})")
                 
                 # Wait for response with timeout
                 try:
@@ -83,13 +93,13 @@ class NATClassifier:
                         return (mapped_ip, mapped_port)
                 
                 except asyncio.TimeoutError:
-                    logger.debug(f"Probe timeout (attempt {attempt + 1}/{self.retries})")
-                    await asyncio.sleep(0.1)  # Brief pause before retry
+                    logger.debug(f"Probe timeout (attempt {attempt + 1}/{retries})")
+                    await asyncio.sleep(retry_delay)
                     continue
             
             except Exception as e:
                 logger.error(f"Probe error: {e}")
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(retry_delay)
                 continue
         
         return None
@@ -106,6 +116,51 @@ class NATClassifier:
             return data
 
         return await loop.run_in_executor(None, _blocking_recv)
+
+    def _classify_from_mappings(
+        self,
+        mapped_1: Tuple[str, int],
+        mapped_2: Tuple[str, int],
+        local_port: int
+    ) -> NATClassificationResult:
+        """Classify NAT type from two mapped address results.
+        
+        Shared logic used by both classify() and classify_with_socket().
+        """
+        same_ip = mapped_1[0] == mapped_2[0]
+        same_port = mapped_1[1] == mapped_2[1]
+
+        if same_ip and same_port:
+            # Full cone or restricted cone (can't distinguish without more tests)
+            nat_type = 'full_cone'  # Assume best case
+            confidence = 'high'
+        elif same_ip and not same_port:
+            # Port-restricted or symmetric
+            port_diff = abs(mapped_1[1] - mapped_2[1])
+            if port_diff <= 10:  # Small port difference might be port-restricted
+                nat_type = 'port_restricted'
+                confidence = 'low'
+            else:
+                nat_type = 'symmetric'
+                confidence = 'high'
+        else:
+            # Different IPs - definitely symmetric or multi-NAT
+            nat_type = 'symmetric'
+            confidence = 'high'
+
+        result = NATClassificationResult(
+            nat_type=nat_type,
+            mapped_addr_1=mapped_1,
+            mapped_addr_2=mapped_2,
+            local_port=local_port,
+            confidence=confidence
+        )
+
+        logger.info(f"NAT Classification: {nat_type} (confidence: {confidence})")
+        logger.info(f"  Mapped addr 1: {mapped_1[0]}:{mapped_1[1]}")
+        logger.info(f"  Mapped addr 2: {mapped_2[0]}:{mapped_2[1]}")
+
+        return result
 
     async def classify(self, peer_id: str, local_port: int = 0) -> Optional[NATClassificationResult]:
         """
@@ -149,96 +204,21 @@ class NATClassifier:
                 actual_local_port = sock2.getsockname()[1]
 
                 # Extended probe with more patience
-                mapped_1 = await self._probe_port_extended(sock2, peer_id, self.stun_port_1)
-                mapped_2 = await self._probe_port_extended(sock2, peer_id, self.stun_port_2)
+                mapped_1 = await self.probe_port(sock2, peer_id, self.stun_port_1,
+                                                 retries=self.extended_retries, retry_delay=0.2)
+                mapped_2 = await self.probe_port(sock2, peer_id, self.stun_port_2,
+                                                 retries=self.extended_retries, retry_delay=0.2)
                 sock2.close()
 
             if not mapped_1 or not mapped_2:
                 logger.error("Failed to get responses from STUN server (both standard and extended attempts)")
                 return None
 
-            # Classify based on mapped addresses
-            same_ip = mapped_1[0] == mapped_2[0]
-            same_port = mapped_1[1] == mapped_2[1]
-
-            if same_ip and same_port:
-                # Full cone or restricted cone (can't distinguish without more tests)
-                nat_type = 'full_cone'  # Assume best case
-                confidence = 'high'
-            elif same_ip and not same_port:
-                # Port-restricted or symmetric
-                port_diff = abs(mapped_1[1] - mapped_2[1])
-                if port_diff <= 10:  # Small port difference might be port-restricted
-                    nat_type = 'port_restricted'
-                    confidence = 'low'
-                else:
-                    nat_type = 'symmetric'
-                    confidence = 'high'
-            else:
-                # Different IPs - definitely symmetric or multi-NAT
-                nat_type = 'symmetric'
-                confidence = 'high'
-
-            result = NATClassificationResult(
-                nat_type=nat_type,
-                mapped_addr_1=mapped_1,
-                mapped_addr_2=mapped_2,
-                local_port=actual_local_port,
-                confidence=confidence
-            )
-
-            logger.info(f"NAT Classification: {nat_type} (confidence: {confidence})")
-            logger.info(f"  Mapped addr 1: {mapped_1[0]}:{mapped_1[1]}")
-            logger.info(f"  Mapped addr 2: {mapped_2[0]}:{mapped_2[1]}")
-
-            return result
+            return self._classify_from_mappings(mapped_1, mapped_2, actual_local_port)
 
         finally:
             sock.close()
 
-    async def _probe_port_extended(self, sock: socket.socket, peer_id: str,
-                                   server_port: int, retries: int = None) -> Optional[Tuple[str, int]]:
-        """Extended probe with more retries for difficult network conditions"""
-        if retries is None:
-            retries = self.extended_retries
-
-        loop = asyncio.get_event_loop()
-        probe = json.dumps({
-            'type': 'probe',
-            'peer_id': peer_id
-        }).encode()
-
-        for attempt in range(retries):
-            try:
-                sock.setblocking(False)
-                sock.sendto(probe, (self.server_host, server_port))
-                logger.debug(f"Extended probe attempt {attempt + 1}/{retries} to {self.server_host}:{server_port}")
-
-                try:
-                    data = await asyncio.wait_for(
-                        self._recv_with_select(sock, 1024),
-                        timeout=self.timeout
-                    )
-                    response = json.loads(data.decode())
-
-                    if response.get('type') == 'probe_response':
-                        mapped_ip = response['mapped_ip']
-                        mapped_port = response['mapped_port']
-                        logger.debug(f"Extended probe to port {server_port}: mapped={mapped_ip}:{mapped_port}")
-                        return (mapped_ip, mapped_port)
-
-                except asyncio.TimeoutError:
-                    logger.debug(f"Extended probe timeout (attempt {attempt + 1}/{retries})")
-                    await asyncio.sleep(0.2)  # Slightly longer pause
-                    continue
-
-            except Exception as e:
-                logger.debug(f"Extended probe error: {e}")
-                await asyncio.sleep(0.2)
-                continue
-
-        return None
-    
     async def classify_with_socket(self, peer_id: str, sock: socket.socket) -> Optional[NATClassificationResult]:
         """
         Classify NAT type using an existing socket.
@@ -254,39 +234,16 @@ class NATClassifier:
         # If both failed, use extended probes
         if not mapped_1 and not mapped_2:
             logger.warning(f"Initial STUN probe failed with existing socket, retrying with extended attempts...")
-            mapped_1 = await self._probe_port_extended(sock, peer_id, self.stun_port_1)
-            mapped_2 = await self._probe_port_extended(sock, peer_id, self.stun_port_2)
+            mapped_1 = await self.probe_port(sock, peer_id, self.stun_port_1,
+                                             retries=self.extended_retries, retry_delay=0.2)
+            mapped_2 = await self.probe_port(sock, peer_id, self.stun_port_2,
+                                             retries=self.extended_retries, retry_delay=0.2)
 
         if not mapped_1 or not mapped_2:
             logger.error("Failed to get responses from STUN server (all attempts failed)")
             return None
 
-        # Classify based on mapped addresses
-        same_ip = mapped_1[0] == mapped_2[0]
-        same_port = mapped_1[1] == mapped_2[1]
-
-        if same_ip and same_port:
-            nat_type = 'full_cone'
-            confidence = 'high'
-        elif same_ip and not same_port:
-            port_diff = abs(mapped_1[1] - mapped_2[1])
-            if port_diff <= 10:
-                nat_type = 'port_restricted'
-                confidence = 'low'
-            else:
-                nat_type = 'symmetric'
-                confidence = 'high'
-        else:
-            nat_type = 'symmetric'
-            confidence = 'high'
-
-        return NATClassificationResult(
-            nat_type=nat_type,
-            mapped_addr_1=mapped_1,
-            mapped_addr_2=mapped_2,
-            local_port=local_port,
-            confidence=confidence
-        )
+        return self._classify_from_mappings(mapped_1, mapped_2, local_port)
 
 
 async def main():
