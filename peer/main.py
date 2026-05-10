@@ -1,15 +1,3 @@
-"""
-NAT Traversal Peer - Main Orchestrator
-Ties together all components:
-- NAT classification
-- Authentication with rendezvous server
-- Hole punching
-- QUIC transport with 0-RTT
-- Relay fallback
-- QUIC TLS authentication
-- Metrics collection
-"""
-
 import asyncio
 import argparse
 import json
@@ -24,7 +12,9 @@ import uuid
 import websockets
 from pathlib import Path
 from typing import Optional, Tuple
-import sys
+from peer.signaling import SignalingManager
+from peer.stats import StatManager
+from peer.connection_manager import ConnectionManager
 
 # Add parent directory to path to allow imports when running as script
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -34,8 +24,8 @@ from peer.hole_punch import BidirectionalHolePuncher, HolePunchResult
 from peer.quic_peer import QuicPeer, QuicPeerProtocol
 from peer.relay import RelayClient, RelayPeerAdapter
 from peer.metrics import MetricsCollector, MetricsServer
+from peer.cli import run as run_cli
 from common.auth import TokenAuthClient, ConnectionToken
-
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s'
@@ -44,10 +34,7 @@ logger = logging.getLogger('main')
 
 
 class PeerNode:
-    """
-    Main peer node that orchestrates NAT traversal and connection establishment.
-    """
-    
+
     def __init__(self, peer_id: str, server_host: str, server_ws_port: int = 8765,
                  server_stun_port_1: int = 3478, server_stun_port_2: int = 3479,
                  cert_file: str = None, key_file: str = None,
@@ -63,12 +50,22 @@ class PeerNode:
         base_dir = Path(__file__).parent.parent / 'certs'
         self.cert_file = cert_file or str(base_dir / 'cert.pem')
         self.key_file = key_file or str(base_dir / 'key.pem')
-        
+
+        # Components
+        self.classifier = NATClassifier(
+            server_host, server_stun_port_1, server_stun_port_2
+        )
+        self.metrics = MetricsCollector(peer_id)
+        self.metrics_server = MetricsServer(self.metrics, port=metrics_port)
+        self.auth_client = TokenAuthClient(peer_id, f"ws://{server_host}:{server_ws_port}")
+
+        # Initialize SignalingManager (must come before cert gen so _get_local_ip() is available)
+        self.signaling_manager = SignalingManager(peer_id, server_host, server_ws_port)
+
         # Ensure certs exist
         if not os.path.exists(self.cert_file):
             logger.info("Generating self-signed certificate...")
             os.makedirs(base_dir, exist_ok=True)
-            
             from scripts.gen_certs import generate_certificate
             generate_certificate(
                 cert_file=self.cert_file,
@@ -77,18 +74,41 @@ class PeerNode:
                 days_valid=365,
                 key_type='rsa',
                 key_size=2048,
-                san_ips=['127.0.0.1', self._get_local_ip()],
+                san_ips=['127.0.0.1', self.signaling_manager._get_local_ip()],
                 san_dns=['localhost']
             )
-        
-        # Components
-        self.classifier = NATClassifier(
-            server_host, server_stun_port_1, server_stun_port_2
+
+        # Locks for synchronizing access to shared resources
+        self._ws_lock = asyncio.Lock()
+        self._socket_lock = asyncio.Lock()
+        self._quic_lock = asyncio.Lock()
+        self._protocol_lock = asyncio.Lock()
+        self._relay_lock = asyncio.Lock()
+
+        # Initialize Stats Manager (shares _protocol_lock with PeerNode)
+        self.stats_manager = StatManager(
+            peer_id=peer_id,
+            metrics=self.metrics,
+            signaling_manager=self.signaling_manager,
+            protocol_lock=self._protocol_lock,
         )
-        self.metrics = MetricsCollector(peer_id)
-        self.metrics_server = MetricsServer(self.metrics, port=metrics_port)
-        self.auth_client = TokenAuthClient(peer_id, f"ws://{server_host}:{server_ws_port}")
-        
+
+        # Initialize ConnectionManager (owns hole punch, QUIC, relay logic)
+        self.conn_manager = ConnectionManager(
+            peer_id=peer_id,
+            server_host=server_host,
+            server_ws_port=server_ws_port,
+            cert_file=self.cert_file,
+            key_file=self.key_file,
+            metrics=self.metrics,
+            signaling_manager=self.signaling_manager,
+            stats_manager=self.stats_manager,
+            protocol_lock=self._protocol_lock,
+        )
+
+        # Wire cross-references (breaks circular init dependency)
+        self.stats_manager.conn_manager = self.conn_manager
+
         # State
         self.nat_result: Optional[NATClassificationResult] = None
         self.local_socket: Optional[socket.socket] = None
@@ -99,217 +119,44 @@ class PeerNode:
         self.relay_client: Optional[RelayClient] = None
         self.using_relay = False
         self.relay_target_peer_id: Optional[str] = None
-        
-        # Listener-side relay ping tracking
-        self._relay_ping_seq: int = 0
-        self._relay_ping_times: dict = {}
-        self._relay_last_rtt_ms: float = 0.0
-        self._relay_rtt_samples: list = []
-        
-        # Callbacks
-        self.on_chat_message = None
-        self.on_file_received = None
-        self.on_connected = None
 
-        self._ws_lock = asyncio.Lock()
-        self._socket_lock = asyncio.Lock()
-        self._quic_lock = asyncio.Lock()
-        self._protocol_lock = asyncio.Lock() 
-        self._relay_lock = asyncio.Lock()
+        # Callbacks — private backing stores; use properties below to keep conn_manager in sync
+        self._on_chat_message = None
+        self._on_file_received = None
+        self._on_connected = None
 
-    async def _send_relay_frame(self, target_peer_id: str, payload: bytes) -> bool:
-        """Send a relay frame via the signalling websocket (fallback path for listener peers)."""
-        if len(payload) > 4096:
-            logger.warning("Relay payload too large, dropping")
-            return False
+    # ── Callback properties ────────────────────────────────────────────────
+    # Any assignment (e.g. node.on_chat_message = fn) is automatically
+    # forwarded to conn_manager so the protocol gets wired correctly.
 
-        payload_b64 = base64.b64encode(payload).decode()
-        try:
-            async with self._ws_lock:
-                if not self._is_websocket_open():
-                    if not await self._reconnect_signalling_locked():
-                        return False
-                await self.websocket.send(json.dumps({
-                    'type': 'relay_frame',
-                    'target': target_peer_id,
-                    'payload': payload_b64
-                }))
-            return True
-        except Exception as e:
-            logger.error(f"Failed to send relay frame via signalling websocket: {e}")
-            return False
+    @property
+    def on_chat_message(self):
+        return self._on_chat_message
 
-    def _handle_signalling_relay_frame(self, source_peer: str, payload_b64: str) -> None:
-        """Handle relay frames received on the signalling websocket."""
-        try:
-            payload = base64.b64decode(payload_b64)
-            msg = json.loads(payload.decode())
-            msg_type = msg.get('type')
+    @on_chat_message.setter
+    def on_chat_message(self, fn):
+        self._on_chat_message = fn
+        self.conn_manager.on_chat_message = fn
 
-            # Track receive stats on the metrics collector
-            target = source_peer or self.relay_target_peer_id
-            if target:
-                self.metrics.record_bytes(target, stream_id=4, received=len(payload), msgs_received=1 if msg_type == 'chat' else 0)
+    @property
+    def on_file_received(self):
+        return self._on_file_received
 
-            if msg_type == 'chat' and self.on_chat_message:
-                self.on_chat_message(msg.get('from', source_peer), msg.get('text', ''))
-            elif msg_type == 'control':
-                control_type = msg.get('control_type')
-                if control_type == 'ping':
-                    asyncio.create_task(self._send_relay_frame(source_peer, json.dumps({
-                        'type': 'control',
-                        'control_type': 'pong',
-                        'from': self.peer_id,
-                        'seq': msg.get('seq'),
-                        'ts': msg.get('ts')
-                    }).encode()))
-                elif control_type == 'pong':
-                    # Resolve a pending ping and record RTT
-                    seq = msg.get('seq')
-                    if seq is not None and seq in self._relay_ping_times:
-                        rtt_ms = (time.time() - self._relay_ping_times.pop(seq)) * 1000
-                        self._relay_last_rtt_ms = rtt_ms
-                        self._relay_rtt_samples.append(rtt_ms)
-                        if target:
-                            self.metrics.record_rtt(target, rtt_ms)
-        except Exception as e:
-            logger.error(f"Error handling signalling relay frame: {e}")
-    
-    def _is_websocket_open(self) -> bool:
-        """Check if websocket is open and usable."""
-        if self.websocket is None:
-            return False
-        # A connection is open if it exists and hasn't been explicitly closed
-        try:
-            # Check if connection has a valid state by testing the object
-            return hasattr(self.websocket, 'transport') and self.websocket.transport is not None
-        except:
-            return False
+    @on_file_received.setter
+    def on_file_received(self, fn):
+        self._on_file_received = fn
+        self.conn_manager.on_file_received = fn
 
-    async def _request_token_on_existing_ws(self, target_peer_id: str) -> Optional[ConnectionToken]:
-        """Request auth token reusing the existing signalling websocket."""
-        for attempt in range(2):
-            try:
-                async with self._ws_lock:
-                    if not self.websocket or not self._is_websocket_open():
-                        if not await self._reconnect_signalling_locked():
-                            return None
+    @property
+    def on_connected(self):
+        return self._on_connected
 
-                    token = await self.auth_client.request_token_on_connection(
-                        self.websocket, target_peer_id
-                    )
-                    return token
+    @on_connected.setter
+    def on_connected(self, fn):
+        self._on_connected = fn
+        self.conn_manager.on_connected = fn
 
-            except websockets.exceptions.ConnectionClosed as e:
-                logger.warning(f"WebSocket closed while requesting token (attempt {attempt+1}): {e}")
-                if attempt == 1:
-                    logger.error("Token request failed after reconnect, giving up")
-                    return None
-                # Reconnect and retry
-                async with self._ws_lock:
-                    if not await self._reconnect_signalling_locked():
-                        return None
-                # loop continues to retry
 
-            except Exception as e:
-                logger.error(f"Unexpected error requesting token: {e}")
-                return None
-
-        return None
-
-    async def _ensure_local_socket(self, preferred_port: Optional[int] = None) -> None:
-        """Ensure a valid UDP socket is bound to preferred_port if possible.
-        
-        On Windows, UDP sockets can enter TIME_WAIT after QUIC closes them, preventing
-        immediate rebind. This method retries with delays to wait for TIME_WAIT to clear.
-        If preferred_port is exhausted, falls back to ephemeral allocation.
-        """
-        async with self._socket_lock:
-            if self.local_socket is not None:
-                try:
-                    self.local_socket.getsockname() 
-                    return  # Socket is still valid, no need to recreate
-                except OSError:
-                    logger.warning("Existing local socket is no longer valid, recreating...")
-                    self.local_socket.close()
-                    self.local_socket = None
-                    self.local_port = 0
-
-            bind_port = preferred_port if preferred_port is not None else self.local_port
-
-            # Phase 1: Try preferred port with retries (TIME_WAIT may clear)
-            if bind_port != 0:
-                for attempt in range(5):
-                    try:
-                        self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                        self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                        if hasattr(socket, 'SO_REUSEPORT'):
-                            try:
-                                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-                            except OSError:
-                                pass
-                        self.local_socket.bind(('0.0.0.0', bind_port))
-                        self.local_socket.setblocking(False)
-                        self.local_port = self.local_socket.getsockname()[1]
-                        logger.info(f"Rebound local UDP socket on port: {self.local_port}")
-                        return
-                    except OSError as e:
-                        self.local_socket.close()
-                        self.local_socket = None
-                        # WinError 10013 = port in TIME_WAIT after recent close
-                        is_busy = "10013" in str(e) or "EADDRINUSE" in str(e)
-                        if is_busy:
-                            logger.warning(f"Port {bind_port} in use/TIME_WAIT (attempt {attempt+1}/5), retrying in 1s...")
-                            await asyncio.sleep(1.0)
-                        else:
-                            logger.warning(f"Socket bind to port {bind_port} failed: {e}")
-                            break  # Non-retryable error, skip to ephemeral
-
-                logger.info(f"Preferred port {bind_port} unavailable after retries, using ephemeral")
-
-            # Phase 2: Ephemeral port fallback
-            try:
-                self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-                self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                self.local_socket.bind(('0.0.0.0', 0))
-                self.local_socket.setblocking(False)
-                self.local_port = self.local_socket.getsockname()[1]
-                logger.info(f"Bound local UDP socket on ephemeral port: {self.local_port}")
-                return
-            except OSError as e:
-                if self.local_socket:
-                    self.local_socket.close()
-                    self.local_socket = None
-                raise OSError(f"Failed to bind UDP socket (even ephemeral): {e}")
-    
-    def _get_local_ip(self) -> str:
-        """Get the local/private IP address (LAN IP, not public)"""
-        import psutil
-        
-        try:
-            # Get all network interfaces and their addresses
-            for interface, addrs in psutil.net_if_addrs().items():
-                for addr in addrs:
-                    # Only check IPv4 addresses
-                    if addr.family == socket.AF_INET:
-                        ip = addr.address
-                        if ip and not ip.startswith('127.') and ip != '0.0.0.0':
-                            # Prefer private IPs (10.x, 172.16-31.x, 192.168.x)
-                            if (ip.startswith('10.') or 
-                                ip.startswith('192.168.') or
-                                (ip.startswith('172.') and 16 <= int(ip.split('.')[1]) <= 31)):
-                                return ip
-            
-            # Fallback: use socket method (may return public IP if no private IP)
-            s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-            s.connect(('8.8.8.8', 80))  # Google DNS
-            local_ip = s.getsockname()[0]
-            s.close()
-            return local_ip
-        except Exception as e:
-            logger.warning(f"Could not determine local IP: {e}")
-            return None
-    
     async def start(self):
         """Start the peer node"""
         logger.info(f"[STARTUP] Initializing peer: {self.peer_id}")
@@ -318,20 +165,14 @@ class PeerNode:
         logger.info(f"[STARTUP] Starting metrics HTTP server on port {self.metrics_port}...")
         self.metrics_server.start()
         
-        # Create local UDP socket for NAT probing and hole punching
         logger.info(f"[STARTUP] Binding local UDP socket for NAT classification...")
-        self.local_socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        # Allow quick reuse of port (important for localhost testing on Windows)
-        self.local_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.local_socket.bind(('0.0.0.0', 0))
-        self.local_socket.setblocking(False)
-        self.local_port = self.local_socket.getsockname()[1]
-        logger.info(f"[SOCKET] Bound to local port: {self.local_port}")
+        await self.conn_manager._ensure_local_socket(preferred_port=0)
+        logger.info(f"[SOCKET] Bound to local port: {self.conn_manager.local_port}")
         
         # Classify NAT type
         logger.info(f"[NAT] Classifying NAT type via {self.server_host}:{self.server_stun_port_1}/{self.server_stun_port_2}...")
         self.nat_result = await self.classifier.classify_with_socket(
-            self.peer_id, self.local_socket
+            self.peer_id, self.conn_manager.local_socket
         )
         
         if self.nat_result:
@@ -349,14 +190,22 @@ class PeerNode:
             logger.error(f"[WS] Failed to connect: {e}")
             raise
 
-        await self._register_with_server()
+        # Propagate connection state to SignalingManager and ConnectionManager
+        self.signaling_manager.websocket = self.websocket
+        self.signaling_manager.nat_result = self.nat_result
+        self.signaling_manager.local_port = self.conn_manager.local_port
+        self.conn_manager.websocket = self.websocket
+        self.conn_manager.nat_result = self.nat_result
+
+        await self.signaling_manager._register_with_server()
         
-        local_ip = self._get_local_ip() or 'N/A'
+        local_ip = self.signaling_manager._get_local_ip() or 'N/A'
         nat_type = self.nat_result.nat_type if self.nat_result else 'unknown'
         nat_confidence = self.nat_result.confidence if self.nat_result else 'N/A'
         mapped_ip = f"{self.nat_result.mapped_addr_1[0]}:{self.nat_result.mapped_addr_1[1]}" if self.nat_result and self.nat_result.mapped_addr_1 else 'N/A'
+        local_port = self.conn_manager.local_port
 
-        local_addr   = f"{local_ip}:{self.local_port}"
+        local_addr   = f"{local_ip}:{local_port}"
         signal_addr  = f"ws://{self.server_host}:{self.server_ws_port}"
         metrics_addr = f"http://localhost:{self.metrics_port}"
         nat_info     = f"{nat_type}  (confidence: {nat_confidence})"
@@ -374,8 +223,6 @@ class PeerNode:
         value_w = max(len(r[1]) for r in rows)
         total_w = label_w + value_w + 5  # 2 borders + 3 separators
 
-        title      = "PEER INFORMATION"
-        header     = "PEER STARTED - READY FOR CONNECTIONS"
         title      = "PEER INFORMATION"
         header     = "PEER STARTED - READY FOR CONNECTIONS"
         top        = f"┌{'─' * (total_w)}┐"
@@ -397,76 +244,30 @@ class PeerNode:
                 print(mid_div)
         print(bottom)
         print(f"{'=' * total_w}")
-        print(f"  ✓ UDP Socket : {self.local_port}")
-        print(f"  ✓ NAT        : {nat_type} ({nat_confidence})")
-        print(f"  ✓ Metrics    : {metrics_addr}/")
-        print(f"  ✓ Ready to accept connections (peer-to-peer or relay)")
+        print(f"  UDP Socket : {local_port}")
+        print(f"  NAT        : {nat_type} ({nat_confidence})")
+        print(f"  Metrics    : {metrics_addr}/")
+        print(f"  Ready to accept connections (peer-to-peer or relay)")
         print(f"{'=' * total_w}")
         print()
-        
+
         return self
 
-    async def _register_with_server(self):
-        """Register this peer on the signalling websocket."""
-        async with self._ws_lock:
-            await self._register_with_server_locked()
-    
-    async def _register_with_server_locked(self):
-        """Internal: register without acquiring lock (assumes caller holds _ws_lock)."""
-        # Get local IP address
-        local_ip = self._get_local_ip()
-
-        if not self.websocket:
-            raise RuntimeError("WebSocket is not connected")
-
-        await self.websocket.send(json.dumps({
-            'type': 'register',
-            'peer_id': self.peer_id,
-            'mapped_addr': list(self.nat_result.mapped_addr_1) if self.nat_result else None,
-            'local_addr': [local_ip, self.local_port],  # Private IP for hairpin NAT
-            'nat_type': self.nat_result.nat_type if self.nat_result else 'unknown'
-        }))
-
-        response = await self.websocket.recv()
-        data = json.loads(response)
-        logger.info(f"Registered with server: {data}")
-
-    async def _reconnect_signalling(self) -> bool:
-        """Reconnect and re-register signalling websocket after disconnect."""
-        async with self._ws_lock:
-            return await self._reconnect_signalling_locked()
-    
-    async def _reconnect_signalling_locked(self) -> bool:
-        """Internal: reconnect without acquiring lock (assumes caller holds _ws_lock)."""
-        if self._is_websocket_open():
-            return True  # already reconnected by another coroutine
-        ws_url = f"ws://{self.server_host}:{self.server_ws_port}"
-        try:
-            self.websocket = await websockets.connect(ws_url)
-            await self._register_with_server_locked()
-            logger.info("Reconnected signalling websocket")
-            return True
-        except Exception as e:
-            logger.error(f"Failed to reconnect signalling websocket: {e}")
-            return False
-    
     async def connect_to_peer(self, target_peer_id: str) -> bool:
         """
-        Connect to another peer.
-        
-        Flow:
-        1. Request authentication token from server for target peer
-        2. Send connect request via signalling server
-        3. Receive peer's mapped address
-        4. Attempt hole punching
-        5. If fails, fall back to relay
-        6. Establish QUIC connection with TLS handshake
+            Flow:
+            1. Request authentication token from server for target peer
+            2. Send connect request via signalling server
+            3. Receive peer's mapped address
+            4. Attempt hole punching
+            5. If fails, fall back to relay
+            6. Establish QUIC connection with TLS handshake
         """
         logger.info(f"[CONNECT] Initiating connection to peer: {target_peer_id}")
 
         # Request authentication token
         logger.debug(f"[CONNECT] Requesting auth token for {target_peer_id}...")
-        token = await self._request_token_on_existing_ws(target_peer_id)
+        token = await self.signaling_manager._request_token_on_existing_ws(self.auth_client, target_peer_id)
         if not token:
             logger.error(f"[CONNECT] Failed to obtain auth token, cannot proceed")
             return False
@@ -486,11 +287,9 @@ class PeerNode:
         try:
             logger.debug(f"[CONNECT] Sending connect request via signalling...")
             async with self._ws_lock:
-                if not self._is_websocket_open():
-                    # Use unlocked version to avoid nested lock acquisition
-                    if not await self._reconnect_signalling_locked():
-                        logger.error("[CONNECT] Failed to reconnect websocket")
-                        return False
+                if not await self.signaling_manager._ensure_signalling_connected():
+                    logger.error("[CONNECT] Failed to reconnect websocket")
+                    return False
                 
                 await self.websocket.send(json.dumps({
                     'type': 'connect_request',
@@ -504,7 +303,7 @@ class PeerNode:
                 response = await self.websocket.recv()
         except websockets.exceptions.ConnectionClosed as e:
             logger.warning(f"[CONNECT] Signalling websocket closed: {e}")
-            await self._reconnect_signalling()
+            await self.signaling_manager._reconnect_signalling()
             return False
 
         peer_info = json.loads(response)
@@ -555,11 +354,6 @@ class PeerNode:
         
         # Wait for synchronized punch start time if provided
         punch_start_time = peer_info.get('punch_start_time')
-        delay = (punch_start_time - time.time()) if punch_start_time else None
-        if delay > 0:
-            logger.info(f"[PUNCH] Synchronizing: waiting {delay:.2f}s before hole punch...")
-            await asyncio.sleep(delay)
-
         if punch_start_time:
             wait_time = punch_start_time - time.time()
             if wait_time > 0:
@@ -573,7 +367,7 @@ class PeerNode:
         # Attempt hole punching
         if not both_symmetric:
             logger.info(f"[PUNCH] Attempting hole punch | My NAT={my_nat}, Peer NAT={peer_nat_type}")
-            punch_result = await self._attempt_hole_punch(target_peer_id, actual_addr, peer_nat_type)
+            punch_result = await self.conn_manager._attempt_hole_punch(target_peer_id, actual_addr, peer_nat_type)
             
             if punch_result.success:
                 logger.info(f"[PUNCH] Hole punch SUCCESS in {punch_result.time_taken_ms:.0f}ms with {punch_result.attempts} attempts")
@@ -586,233 +380,27 @@ class PeerNode:
                 # Establish QUIC over the punched hole
                 # Use the address hole-punch actually confirmed, not stale signalling addr
                 confirmed_addr = punch_result.peer_addr if punch_result.peer_addr else actual_addr
-                return await self._establish_quic(target_peer_id, confirmed_addr)
+                return await self.conn_manager._establish_quic(target_peer_id, confirmed_addr)
         else:
             logger.warning(f"[PUNCH] Skipping hole punch: both peers have symmetric NAT (high failure probability)")
         
         # Hole punch failed or skipped, use relay
         logger.info("[PUNCH] Hole punch unsuccessful, falling back to relay mode")
         self.metrics.record_hole_punch(target_peer_id, False, 3000, 15)
-        return await self._establish_relay(target_peer_id)
-    
-    async def _attempt_hole_punch(self, target_peer_id: str, peer_addr: Tuple[str, int],
-                                   peer_nat_type: str) -> HolePunchResult:
-        """Attempt UDP hole punching"""
-        logger.info(f"Attempting hole punch to {peer_addr}")
-
-        # A previous QUIC attempt may have closed the socket; re-create it for retries.
-        await self._ensure_local_socket(preferred_port=self.local_port)
-        
-        my_nat = self.nat_result.nat_type if self.nat_result else 'unknown'
-        puncher = BidirectionalHolePuncher(self.local_socket, self.peer_id)
-        
-        return await puncher.execute(peer_addr, my_nat, peer_nat_type, target_peer_id=target_peer_id)
-    
-    async def _establish_quic(self, target_peer_id: str, peer_addr: Tuple[str, int]) -> bool:
-        """Establish QUIC connection after successful hole punch"""
-        logger.info(f"[QUIC] Initiating QUIC handshake to {peer_addr[0]}:{peer_addr[1]}")
-        
-        try:
-            # Close the hole punch socket - QUIC will create its own
-            async with self._socket_lock:
-                if self.local_socket:
-                    self.local_socket.close()
-                    self.local_socket = None
-                    logger.debug(f"[SOCKET] Closed hole punch socket")
-            
-            ticket_store_file = f".session_tickets_{self.peer_id}.pkl"
-            
-            async with self._quic_lock:
-                if self._quic_peer:
-                    old_quic = self._quic_peer
-                    self._quic_peer = None
-                    await old_quic.close()
-
-                self._quic_peer = QuicPeer(
-                    self.peer_id,
-                    self.cert_file,
-                    self.key_file,
-                    ticket_store_file=ticket_store_file
-                )
-            
-            start_time = time.time()
-            # Add timeout for QUIC connection - if peer isn't listening, fail quickly
-            logger.debug(f"[QUIC] Connecting (timeout=5s)...")
-            try:
-                async with self._quic_lock:
-                    self.protocol = await asyncio.wait_for(
-                        self._quic_peer.connect(
-                            peer_addr[0], peer_addr[1],
-                            local_port=self.local_port,  # Reuse hole-punched port
-                            target_peer_id=target_peer_id  # Pass peer ID for ticket keying
-                        ),
-                        timeout=5.0  # 5 second timeout for QUIC handshake
-                    )
-            except asyncio.TimeoutError:
-                logger.warning(f"[QUIC] Handshake timeout after 5s to {peer_addr[0]}:{peer_addr[1]}")
-                await asyncio.sleep(0.1)  # Brief pause before cleanup
-                async with self._quic_lock:
-                    quic = self._quic_peer
-                    self._quic_peer = None
-                if quic:
-                    await quic.close()
-                await self._ensure_local_socket(preferred_port=self.local_port)
-                logger.info("[QUIC] Falling back to relay mode due to timeout")
-                self.metrics.record_hole_punch(target_peer_id, True, 3000, 15)  # Mark as success but using relay
-                return await self._establish_relay(target_peer_id)
-            
-            connect_time = (time.time() - start_time) * 1000
-            is_0rtt = getattr(self.protocol, 'early_data_accepted', False)
-            
-            logger.info(f"[QUIC] Handshake complete in {connect_time:.1f}ms | 0-RTT={is_0rtt}")
-            self.metrics.record_connection_established(target_peer_id, is_0rtt=is_0rtt)
-            
-            # Set up callbacks
-            if self.on_chat_message:
-                self.protocol.on_chat_message = self.on_chat_message
-            if self.on_file_received:
-                self.protocol.on_file_chunk = self.on_file_received
-            
-            # Start ping loop for RTT monitoring
-            logger.debug(f"[METRICS] Starting RTT ping loop...")
-            await self.metrics.start_ping_loop(target_peer_id, self.protocol, interval=5.0)
-            
-            # Start periodic stats sync to metrics collector
-            asyncio.create_task(self._sync_stats_loop(target_peer_id))
-            
-            # Notify server of success (with reconnect if needed)
-            try:
-                async with self._ws_lock:
-                    if self._is_websocket_open():
-                        await self.websocket.send(json.dumps({
-                            'type': 'hole_punch_success',
-                            'peer_id': self.peer_id,
-                            'target_peer_id': target_peer_id
-                        }))
-                        logger.debug(f"[CONN] Notified server of successful P2P connection")
-            except Exception as e:
-                logger.warning(f"[CONN] Failed to notify server: {e}")
-            
-            if self.on_connected:
-                self.on_connected(target_peer_id, False)  # Not relay
-            
-            logger.info(f"[CONN] Connected to {target_peer_id} (Direct P2P)")
-            return True
-        
-        except Exception as e:
-            logger.error(f"[QUIC] Connection failed: {e}")
-            async with self._quic_lock:
-                quic = self._quic_peer
-                self._quic_peer = None
-            if quic:
-                await quic.close()
-            await self._ensure_local_socket(preferred_port=self.local_port)
-            return False
-    
-    async def _establish_relay(self, target_peer_id: str) -> bool:
-        """Establish relay connection through server"""
-        async with self._protocol_lock:
-            if self.protocol is not None:
-                logger.warning(f"[RELAY] Skipping relay setup - protocol already active")
-                return False
-        
-        logger.info(f"[RELAY] Initiating WebSocket relay to {target_peer_id}")
-        
-        async with self._relay_lock:
-            self.using_relay = True
-
-        ws_url = f"ws://{self.server_host}:{self.server_ws_port}"
-        
-        self.relay_client = RelayClient(self.peer_id, ws_url)
-        
-        logger.debug(f"[RELAY] Connecting to relay server...")
-        if not await self.relay_client.connect():
-            logger.error("[RELAY] Failed to connect to relay server")
-            return False
-        logger.debug(f"[RELAY] Connected to relay server")
-        
-        logger.debug(f"[RELAY] Requesting relay session for {target_peer_id}...")
-        if not await self.relay_client.request_relay(target_peer_id):
-            logger.error("[RELAY] Failed to establish relay session")
-            return False
-
-        self.metrics.record_relay_fallback(target_peer_id, self.relay_client.session_id)
-        logger.info(f"[RELAY] Session established | ID={self.relay_client.session_id}")
-        
-        # Create adapter for consistent interface
-        adapter = RelayPeerAdapter(self.relay_client, target_peer_id)
-        if self.on_chat_message:
-            adapter.on_chat_message = self.on_chat_message
-        
-        self.protocol = adapter
-        self.metrics.record_connection_established(target_peer_id)
-        
-        # Start ping loop for RTT monitoring (same as QUIC mode)
-        await self.metrics.start_ping_loop(target_peer_id, adapter, interval=5.0)
-        
-        # Start periodic stats sync to metrics collector
-        asyncio.create_task(self._sync_stats_loop(target_peer_id))
-        
-        if self.on_connected:
-            self.on_connected(target_peer_id, True)  # Using relay
-        
-        logger.info(f"[CONN] Connected to {target_peer_id} (Relay/WebSocket fallback)")
-        return True
-    
-    async def _sync_stats_loop(self, target_peer_id: str):
-        """Periodically sync protocol stats into the metrics collector."""
-        try:
-            while True:
-                await asyncio.sleep(5.0)
-                async with self._protocol_lock:
-                    proto = self.protocol
-                if proto:
-                    stats = proto.get_stats()
-                    self.metrics.update_stream_stats(target_peer_id, stats)
-                else:
-                    break  # No longer active
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"Stats sync loop ended: {e}")
-    
-    async def _relay_ping_loop(self, target_peer_id: str, interval: float = 5.0):
-        """Periodic ping loop for listener-side relay RTT measurement via signalling websocket."""
-        try:
-            while self.using_relay:
-                await asyncio.sleep(interval)
-                if not self.using_relay:
-                    break
-                self._relay_ping_seq += 1
-                seq = self._relay_ping_seq
-                self._relay_ping_times[seq] = time.time()
-                await self._send_relay_frame(target_peer_id, json.dumps({
-                    'type': 'control',
-                    'control_type': 'ping',
-                    'from': self.peer_id,
-                    'seq': seq,
-                    'ts': time.time()
-                }).encode())
-        except asyncio.CancelledError:
-            pass
-        except Exception as e:
-            logger.debug(f"Relay ping loop ended: {e}")
+        return await self.conn_manager._establish_relay(target_peer_id)
     
     async def listen_for_connections(self, callback=None):
-        """Listen for incoming connection requests"""
         logger.info("\rListening for incoming connections...")
         print(f"\n\r[{self.peer_id}]> ", end='', flush=True)
         
         while True:
             try:
-                # Check if reconnect needed (outside lock first)
+                # Check if reconnect needed
                 async with self._ws_lock:
-                    if not self._is_websocket_open():
-                        # Reconnect while holding lock
-                        if not await self._reconnect_signalling_locked():
-                            logger.error("Failed to reconnect, retrying...")
-                            await asyncio.sleep(2.0)  # Back off before retry
-                            continue
+                    if not await self.signaling_manager._ensure_signalling_connected():
+                        logger.error("Failed to reconnect, retrying...")
+                        await asyncio.sleep(2.0)  # Back off before retry
+                        continue
                     
                     if not self.websocket:
                         logger.warning("Websocket still None after reconnect attempt")
@@ -854,10 +442,10 @@ class PeerNode:
                     logger.info(f"Relay session {session_id} from {initiator}")
                     
                     # Set up relay receiver
-                    async with self._relay_lock:
-                        self.using_relay = True
+                    async with self.conn_manager._relay_lock:
+                        self.conn_manager.using_relay = True
                         if initiator:
-                            self.relay_target_peer_id = initiator
+                            self.conn_manager.relay_target_peer_id = initiator
 
                     # Start metrics tracking for the listener-side relay
                     if initiator:
@@ -872,26 +460,26 @@ class PeerNode:
                         self.metrics.record_relay_fallback(initiator, session_id or '')
                         self.metrics.record_connection_established(initiator)
                         # Start RTT ping loop for listener-side relay
-                        asyncio.create_task(self._relay_ping_loop(initiator))
+                        asyncio.create_task(self.stats_manager._relay_ping_loop(initiator))
 
                     if self.on_connected and initiator:
                         self.on_connected(initiator, True)
 
                 elif msg_type == 'relay_frame':
-                    self._handle_signalling_relay_frame(
+                    self.signaling_manager._handle_signalling_relay_frame(
                         data.get('source', ''),
                         data.get('payload', '')
                     )
             except websockets.exceptions.ConnectionClosed:
-                await self._reconnect_signalling()
+                await self.signaling_manager._reconnect_signalling()
             except Exception as e:
                 logger.error(f"Error in listen_for_connections: {e}")
 
     async def _handle_incoming_connection(self, peer_id: str, actual_addr: str, data: dict, callback=None):
         # Close previous QUIC server/connection to release the port
-        async with self._quic_lock:
-            old_quic = self._quic_peer
-            self._quic_peer = None
+        async with self.conn_manager._quic_lock:
+            old_quic = self.conn_manager._quic_peer
+            self.conn_manager._quic_peer = None
         if old_quic:
             logger.info(f"[CLEANUP] Closing previous QUIC connection before new session with {peer_id}")
             await old_quic.close()
@@ -900,16 +488,16 @@ class PeerNode:
 
         # Clear stale protocol/relay state from previous session
         async with self._protocol_lock:
-            self.protocol = None
-        async with self._relay_lock:
-            self.using_relay = False
-            self.relay_target_peer_id = None
-        if self.relay_client:
+            self.conn_manager.protocol = None
+        async with self.conn_manager._relay_lock:
+            self.conn_manager.using_relay = False
+            self.conn_manager.relay_target_peer_id = None
+        if self.conn_manager.relay_client:
             try:
-                await self.relay_client.close()
+                await self.conn_manager.relay_client.close()
             except Exception:
                 pass
-            self.relay_client = None
+            self.conn_manager.relay_client = None
 
         # Start metrics
         self.metrics.start_connection(peer_id)
@@ -923,11 +511,6 @@ class PeerNode:
         
         # Wait for synchronized punch start time if provided
         punch_start_time = data.get('punch_start_time')
-        delay = (punch_start_time - time.time()) if punch_start_time else None
-        if delay and delay > 0:
-            logger.info(f"Waiting {delay:.2f}s for synchronized hole punch start...")
-            await asyncio.sleep(delay)
-            
         if punch_start_time:
             wait_time = punch_start_time - time.time()
             if wait_time > 0:
@@ -935,7 +518,7 @@ class PeerNode:
                 await asyncio.sleep(wait_time)
         
         # Attempt hole punch (peer will punch simultaneously)
-        punch_result = await self._attempt_hole_punch(
+        punch_result = await self.conn_manager._attempt_hole_punch(
             peer_id, actual_addr,
             data.get('nat_type', 'unknown')
         )
@@ -944,117 +527,39 @@ class PeerNode:
             self.metrics.record_hole_punch(peer_id, True, punch_result.time_taken_ms, punch_result.attempts)
             # Wait for QUIC connection as server
             # The initiating peer connects, we listen
-            success = await self._listen_quic(peer_id)
-            
+            success = await self.conn_manager._listen_quic(peer_id)
+
             # If QUIC listen times out, fall back to relay
             if not success:
                 logger.info("QUIC listen timed out, falling back to relay")
-                success = await self._establish_relay(peer_id)
+                success = await self.conn_manager._establish_relay(peer_id)
         else:
             self.metrics.record_hole_punch(peer_id, False, 3000, 15)
-            success = await self._establish_relay(peer_id)
+            success = await self.conn_manager._establish_relay(peer_id)
         
         if callback:
             callback(peer_id, success)
-
-    async def _listen_quic(self, expected_peer_id: str) -> bool:
-        """Listen for incoming QUIC connection"""
-        logger.info(f"Listening for QUIC from {expected_peer_id} on port {self.local_port}")
-        
-        try:
-            # Close the hole punch socket to free the port for QUIC
-            async with self._socket_lock:
-                if self.local_socket:
-                    self.local_socket.close()
-                    self.local_socket = None
-                    logger.debug(f"Closed hole punch socket")
-            
-            async with self._quic_lock:
-                if self._quic_peer:
-                    old = self._quic_peer
-                    self._quic_peer = None
-                    await old.close()
-
-                ticket_store_file = f".session_tickets_{self.peer_id}.pkl"
-                self._quic_peer = QuicPeer(
-                    self.peer_id,
-                    self.cert_file,
-                    self.key_file,
-                    ticket_store_file=ticket_store_file
-                )
-            
-            connected_event = asyncio.Event()
-            
-            def on_connection(protocol):
-                self.protocol = protocol
-                if self.on_chat_message:
-                    protocol.on_chat_message = self.on_chat_message
-                if self.on_file_received:
-                    protocol.on_file_chunk = self.on_file_received
-                connected_event.set()
-            
-            await self._quic_peer.listen('0.0.0.0', self.local_port, on_connection=on_connection)
-            
-            # If connection already arrived during listen() call itself, don't wait
-            if not connected_event.is_set():
-                try:
-                    await asyncio.wait_for(connected_event.wait(), timeout=10.0)
-                except asyncio.TimeoutError:
-                    logger.error("Timeout waiting for QUIC connection")
-                    async with self._quic_lock:
-                        quic = self._quic_peer
-                        self._quic_peer = None
-                    if quic:
-                        await quic.close()
-                    self.local_port = 0
-                    await self._ensure_local_socket(preferred_port=self.local_port)
-                    return False
-        
-            logger.info("QUIC connection received")
-            
-            self.metrics.record_connection_established(expected_peer_id)
-            await self.metrics.start_ping_loop(expected_peer_id, self.protocol, interval=5.0)
-            
-            # Start periodic stats sync to metrics collector
-            asyncio.create_task(self._sync_stats_loop(expected_peer_id))
-            
-            if self.on_connected:
-                self.on_connected(expected_peer_id, False)
-            
-            return True
-        
-        except Exception as e:
-            logger.error(f"QUIC listen error: {e}")
-            async with self._quic_lock:
-                quic = self._quic_peer
-                self._quic_peer = None
-            if quic:
-                await quic.close()
-            self.local_port = 0
-            await self._ensure_local_socket(preferred_port=self.local_port)
-            return False
-        
     
     async def send_chat(self, text: str):
         """Send chat message to connected peer"""
-        async with self._relay_lock:
-            if self.using_relay and self.relay_target_peer_id and not self.relay_client:
+        async with self.conn_manager._relay_lock:
+            if self.conn_manager.using_relay and self.conn_manager.relay_target_peer_id and not self.conn_manager.relay_client:
                 msg = json.dumps({
                     'type': 'chat',
                     'from': self.peer_id,
                     'text': text,
                     'ts': time.time()
                 }).encode()
-                success = await self._send_relay_frame(self.relay_target_peer_id, msg)
+                success = await self.signaling_manager._send_relay_frame(self.conn_manager.relay_target_peer_id, msg)
                 # Track send stats on the metrics collector for listener-side relay
                 if success:
                     self.metrics.record_bytes(
-                        self.relay_target_peer_id, stream_id=4, sent=len(msg), msgs_sent=1
+                        self.conn_manager.relay_target_peer_id, stream_id=4, sent=len(msg), msgs_sent=1
                     )
                 return
 
         async with self._protocol_lock:
-            proto = self.protocol
+            proto = self.conn_manager.protocol
             if proto and hasattr(proto, 'send_chat'):
                 result = proto.send_chat(text, self.peer_id)
                 if asyncio.iscoroutine(result):
@@ -1062,13 +567,13 @@ class PeerNode:
     
     async def send_file(self, filepath: str):
         """Send file to connected peer"""
-        async with self._relay_lock:
-            if self.using_relay:
+        async with self.conn_manager._relay_lock:
+            if self.conn_manager.using_relay:
                 logger.warning("File transfer not available in relay mode")
                 return
 
         async with self._protocol_lock:
-            proto = self.protocol
+            proto = self.conn_manager.protocol
             if proto and hasattr(proto, 'send_file'):
                 file_id = str(uuid.uuid4())[:8]
                 result = proto.send_file(filepath, file_id)
@@ -1076,51 +581,17 @@ class PeerNode:
                     await result
 
     def get_stats(self):
-        """Get connection statistics"""
-        proto = self.protocol
-        if proto:
-            stats = proto.get_stats()
-            # For relay mode with adapter, sync stats to metrics collector
-            if isinstance(proto, RelayPeerAdapter):
-                for target_id in list(self.metrics.connections.keys()):
-                    self.metrics.update_stream_stats(target_id, stats)
-            return stats
-        # Listener-side relay: build stats from metrics collector
-        if self.using_relay and self.relay_target_peer_id:
-            conn = self.metrics.get_connection(self.relay_target_peer_id)
-            if conn:
-                avg_rtt = (sum(self._relay_rtt_samples) / len(self._relay_rtt_samples)) if self._relay_rtt_samples else 0.0
-                return {
-                    0: {
-                        'bytes_sent': 0, 'bytes_received': 0,
-                        'messages_sent': 0, 'messages_received': 0,
-                        'last_rtt_ms': self._relay_last_rtt_ms,
-                        'avg_rtt_ms': avg_rtt,
-                        'is_relay': True
-                    },
-                    4: {
-                        'bytes_sent': conn.stream_stats.get(4, {}).get('bytes_sent', 0) if conn.stream_stats else conn.total_bytes_sent,
-                        'bytes_received': conn.stream_stats.get(4, {}).get('bytes_received', 0) if conn.stream_stats else conn.total_bytes_received,
-                        'messages_sent': conn.stream_stats.get(4, {}).get('messages_sent', 0) if conn.stream_stats else conn.total_messages_sent,
-                        'messages_received': conn.stream_stats.get(4, {}).get('messages_received', 0) if conn.stream_stats else conn.total_messages_received,
-                        'is_relay': True
-                    },
-                    8: {
-                        'bytes_sent': 0, 'bytes_received': 0,
-                        'messages_sent': 0, 'messages_received': 0,
-                        'disabled': True, 'reason': 'File transfer disabled in relay mode'
-                    }
-                }
-        return {}
-    
+        """Get connection statistics (delegates to StatManager)."""
+        return self.stats_manager.get_stats()
+
     async def stop(self):
         """Stop the peer node"""
         logger.info("[SHUTDOWN] Stopping peer node...")
 
         logger.debug("[SHUTDOWN] Closing QUIC connection...")
-        async with self._quic_lock:
-            quic = self._quic_peer
-            self._quic_peer = None
+        async with self.conn_manager._quic_lock:
+            quic = self.conn_manager._quic_peer
+            self.conn_manager._quic_peer = None
         if quic:
             await quic.close()
             logger.debug("[SHUTDOWN] QUIC closed")
@@ -1131,14 +602,14 @@ class PeerNode:
             logger.debug("[SHUTDOWN] Websocket closed")
         
         logger.debug("[SHUTDOWN] Closing relay connection...")
-        if self.relay_client:
-            await self.relay_client.close()
+        if self.conn_manager.relay_client:
+            await self.conn_manager.relay_client.close()
             logger.debug("[SHUTDOWN] Relay closed")
         
         logger.debug("[SHUTDOWN] Closing UDP socket...")
-        async with self._socket_lock:
-            if self.local_socket:
-                self.local_socket.close()
+        async with self.conn_manager._socket_lock:
+            if self.conn_manager.local_socket:
+                self.conn_manager.local_socket.close()
                 logger.debug("[SHUTDOWN] UDP socket closed")
         
         logger.debug("[SHUTDOWN] Stopping metrics server...")
@@ -1146,196 +617,13 @@ class PeerNode:
         
         logger.info("[SHUTDOWN] Peer stopped")
 
-
-async def interactive_mode(node: PeerNode, target_peer_id: str = None):
-    """Interactive chat mode"""
-    
-    def on_chat(from_peer: str, text: str):
-        print(f"\n[{from_peer}]: {text}")
-        print(f"\r[{node.peer_id}]> ", end='', flush=True)
-    
-    def on_connected(peer_id: str, is_relay: bool):
-        mode = "relay" if is_relay else "direct"
-        print(f"\n*** Connected to {peer_id} ({mode} mode) ***")
-        print(f"\r[{node.peer_id}]> ", end='', flush=True)
-
-    def on_file_received(file_id: str, file_data: bytes, metadata: dict):
-        filename = os.path.basename(metadata.get('filename', f"received_{file_id}.bin"))
-        output_dir = Path("received_files") / node.peer_id
-        output_dir.mkdir(parents=True, exist_ok=True)
-        output_path = output_dir / filename
-
-        if output_path.exists():
-            output_path = output_dir / f"{file_id}_{filename}"
-
-        with open(output_path, 'wb') as f:
-            f.write(file_data)
-
-        print(f"\n*** File received: {filename} ({len(file_data)} bytes) -> {output_path} ***")
-        print(f"\r[{node.peer_id}]> ", end='', flush=True)
-    
-    node.on_chat_message = on_chat
-    node.on_connected = on_connected
-    node.on_file_received = on_file_received
-    
-    if target_peer_id:
-        # Initiator mode - connect to peer with retries
-        max_retries = 5
-        retry_delay = 2.0  # seconds
-        
-        for attempt in range(1, max_retries + 1):
-            print(f"Connecting to peer: {target_peer_id} (attempt {attempt}/{max_retries})...")
-            success = await node.connect_to_peer(target_peer_id)
-            if success:
-                break
-            
-            if attempt < max_retries:
-                print(f"Connection failed, retrying in {retry_delay}s...")
-                await asyncio.sleep(retry_delay)
-            else:
-                print("Failed to connect after all retries")
-                return
-    else:
-        # Listener mode - wait for connections
-        print("\rWaiting for incoming connections...")
-        asyncio.create_task(node.listen_for_connections())
-    
-    # Interactive chat loop
-    print(f"\nType messages and press Enter. Commands: /stats, /file <path>, /quit")
-    
-    loop = asyncio.get_event_loop()
-    
-    while True:
-        try:
-            line = await loop.run_in_executor(None, lambda: input(f"\r[{node.peer_id}]> "))
-            
-            if line.startswith('/quit'):
-                break
-            elif line.startswith('/stats'):
-                stats = node.get_stats()
-                print_formatted_stats(stats)
-            elif line.startswith('/file '):
-                filepath = line[6:].strip()
-                if os.path.exists(filepath):
-                    await node.send_file(filepath)
-                else:
-                    print(f"File not found: {filepath}")
-            elif line:
-                await node.send_chat(line)
-        
-        except EOFError:
-            break
-        except KeyboardInterrupt:
-            break
-
-
-def print_formatted_stats(stats: dict):
-    """Print stats in a clean tabular format"""
-    # Aggregate totals
-    total_sent = 0
-    total_received = 0
-    total_msgs_sent = 0
-    total_msgs_received = 0
-    rtt_samples = []
-    last_rtt = 0.0
-    
-    # Per-category stats
-    categories = {
-        'Control': {'sent': 0, 'recv': 0, 'msgs_sent': 0, 'msgs_recv': 0},
-        'Chat': {'sent': 0, 'recv': 0, 'msgs_sent': 0, 'msgs_recv': 0},
-        'File': {'sent': 0, 'recv': 0, 'msgs_sent': 0, 'msgs_recv': 0},
-    }
-    
-    for stream_id, data in stats.items():
-        stream_id = int(stream_id)
-        cat_idx = (stream_id // 4) % 3
-        cat_name = ['Control', 'Chat', 'File'][cat_idx]
-        
-        categories[cat_name]['sent'] += data.get('bytes_sent', 0)
-        categories[cat_name]['recv'] += data.get('bytes_received', 0)
-        categories[cat_name]['msgs_sent'] += data.get('messages_sent', 0)
-        categories[cat_name]['msgs_recv'] += data.get('messages_received', 0)
-        
-        total_sent += data.get('bytes_sent', 0)
-        total_received += data.get('bytes_received', 0)
-        total_msgs_sent += data.get('messages_sent', 0)
-        total_msgs_received += data.get('messages_received', 0)
-        
-        if data.get('last_rtt_ms', 0) > 0:
-            last_rtt = data['last_rtt_ms']
-        if data.get('avg_rtt_ms', 0) > 0:
-            rtt_samples.append(data['avg_rtt_ms'])
-    
-    avg_rtt = sum(rtt_samples) / len(rtt_samples) if rtt_samples else 0
-    
-    # Format bytes nicely
-    def fmt_bytes(b):
-        if b >= 1024 * 1024:
-            return f"{b / (1024*1024):.1f} MB"
-        elif b >= 1024:
-            return f"{b / 1024:.1f} KB"
-        return f"{b} B"
-    
-    # Print table
-    print("\n" + "=" * 50)
-    print("              CONNECTION STATISTICS")
-    print("=" * 50)
-    print(f"{'Category':<12} {'Sent':<12} {'Received':<12} {'Msgs ↑':<8} {'Msgs ↓':<8}")
-    print("-" * 50)
-    
-    for cat, data in categories.items():
-        if data['sent'] > 0 or data['recv'] > 0 or data['msgs_sent'] > 0 or data['msgs_recv'] > 0:
-            print(f"{cat:<12} {fmt_bytes(data['sent']):<12} {fmt_bytes(data['recv']):<12} {data['msgs_sent']:<8} {data['msgs_recv']:<8}")
-    
-    print("-" * 50)
-    print(f"{'TOTAL':<12} {fmt_bytes(total_sent):<12} {fmt_bytes(total_received):<12} {total_msgs_sent:<8} {total_msgs_received:<8}")
-    print("=" * 50)
-    print(f"  Last RTT: {last_rtt:.2f} ms    Avg RTT: {avg_rtt:.2f} ms")
-    print("=" * 50 + "\n")
-
-
-async def main():
-    parser = argparse.ArgumentParser(description='NAT Traversal Peer')
-    parser.add_argument('--peer-id', default=f'peer-{uuid.uuid4().hex[:6]}',
-                        help='Unique peer identifier')
-    parser.add_argument('--server', required=True, help='Rendezvous server address')
-    parser.add_argument('--ws-port', type=int, default=8765, help='WebSocket port')
-    parser.add_argument('--stun-port-1', type=int, default=3478, help='First STUN port')
-    parser.add_argument('--stun-port-2', type=int, default=3479, help='Second STUN port')
-    parser.add_argument('--metrics-port', type=int, default=9090, help='Metrics HTTP port')
-    parser.add_argument('--connect', help='Target peer ID to connect to')
-    parser.add_argument('--cert', help='TLS certificate file')
-    parser.add_argument('--key', help='TLS private key file')
-    
-    args = parser.parse_args()
-    
-    print(f"=== NAT Traversal Peer ===")
-    print(f"Peer ID: {args.peer_id}")
-    print(f"Server: {args.server}:{args.ws_port}")
-    print(f"Metrics: http://localhost:{args.metrics_port}/")
-    print()
-    
-    node = PeerNode(
-        peer_id=args.peer_id,
-        server_host=args.server,
-        server_ws_port=args.ws_port,
-        server_stun_port_1=args.stun_port_1,
-        server_stun_port_2=args.stun_port_2,
-        cert_file=args.cert,
-        key_file=args.key,
-        metrics_port=args.metrics_port
-    )
-    
-    try:
-        await node.start()
-        await interactive_mode(node, args.connect)
-    finally:
-        await node.stop()
-
+        # Stop the signaling manager
+        logger.info("[SHUTDOWN] Stopping signaling manager...")
+        await self.signaling_manager.stop()
 
 if __name__ == '__main__':
     # On Windows, use SelectorEventLoop to support add_reader() on raw sockets
     if sys.platform == 'win32':
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
     
-    asyncio.run(main())
+    asyncio.run(run_cli())
