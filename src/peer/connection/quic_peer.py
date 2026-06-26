@@ -26,6 +26,12 @@ from aioquic.quic.events import (
 )
 from aioquic.tls import SessionTicket, SessionTicketHandler
 
+try:
+    from nat_core_ext import StreamFramer
+    HAS_CPP_EXT = True
+except ImportError:
+    HAS_CPP_EXT = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('quic_peer')
 
@@ -366,7 +372,13 @@ class QuicPeerProtocol(QuicConnectionProtocol):
         
         # File transfer state
         self._file_transfers: Dict[str, dict] = {}
-        self._file_stream_buffer: bytes = b''  # Buffer for framed file data
+        
+        if HAS_CPP_EXT:
+            self._stream_framers: Dict[int, Any] = {}
+            self._file_framer = StreamFramer()
+        else:
+            self._stream_buffers: Dict[int, bytes] = {}
+            self._file_stream_buffer: bytes = b''
     
     def quic_event_received(self, event: QuicEvent) -> None:
         """Handle QUIC events"""
@@ -397,34 +409,54 @@ class QuicPeerProtocol(QuicConnectionProtocol):
         try:
             # Control stream (0 or 1) and Chat stream (4 or 5) - use length-prefix framing
             if stream_category == 0 or stream_category == 1:
-                # Store buffered data per stream
-                if not hasattr(self, '_stream_buffers'):
-                    self._stream_buffers = {}
-                if stream_id not in self._stream_buffers:
-                    self._stream_buffers[stream_id] = b''
-                
-                self._stream_buffers[stream_id] += data
-                
-                # Process complete framed messages
-                while len(self._stream_buffers[stream_id]) >= 4:
-                    msg_len = struct.unpack('>I', self._stream_buffers[stream_id][:4])[0]
-                    if len(self._stream_buffers[stream_id]) < 4 + msg_len:
-                        break  # Wait for complete message
+                if HAS_CPP_EXT:
+                    if stream_id not in self._stream_framers:
+                        self._stream_framers[stream_id] = StreamFramer()
                     
-                    msg_data = self._stream_buffers[stream_id][4:4 + msg_len]
-                    self._stream_buffers[stream_id] = self._stream_buffers[stream_id][4 + msg_len:]
+                    framer = self._stream_framers[stream_id]
+                    framer.add_data(data)
+                    frames = framer.get_frames()
                     
-                    self.stream_stats[stream_id].messages_received += 1
+                    for msg_data in frames:
+                        self.stream_stats[stream_id].messages_received += 1
+                        msg = json.loads(msg_data.decode())
+                        
+                        # Control stream
+                        if stream_category == 0:
+                            self._handle_control_message(msg, stream_id)
+                        # Chat stream
+                        else:
+                            if msg.get('type') == MSG_CHAT and self.on_chat_message:
+                                self.on_chat_message(msg.get('from', 'unknown'), msg.get('text', ''))
+                else:
+                    # Store buffered data per stream
+                    if not hasattr(self, '_stream_buffers'):
+                        self._stream_buffers = {}
+                    if stream_id not in self._stream_buffers:
+                        self._stream_buffers[stream_id] = b''
                     
-                    msg = json.loads(msg_data.decode())
+                    self._stream_buffers[stream_id] += data
                     
-                    # Control stream
-                    if stream_category == 0:
-                        self._handle_control_message(msg, stream_id)
-                    # Chat stream
-                    else:
-                        if msg.get('type') == MSG_CHAT and self.on_chat_message:
-                            self.on_chat_message(msg.get('from', 'unknown'), msg.get('text', ''))
+                    # Process complete framed messages
+                    while len(self._stream_buffers[stream_id]) >= 4:
+                        msg_len = struct.unpack('>I', self._stream_buffers[stream_id][:4])[0]
+                        if len(self._stream_buffers[stream_id]) < 4 + msg_len:
+                            break  # Wait for complete message
+                        
+                        msg_data = self._stream_buffers[stream_id][4:4 + msg_len]
+                        self._stream_buffers[stream_id] = self._stream_buffers[stream_id][4 + msg_len:]
+                        
+                        self.stream_stats[stream_id].messages_received += 1
+                        
+                        msg = json.loads(msg_data.decode())
+                        
+                        # Control stream
+                        if stream_category == 0:
+                            self._handle_control_message(msg, stream_id)
+                        # Chat stream
+                        else:
+                            if msg.get('type') == MSG_CHAT and self.on_chat_message:
+                                self.on_chat_message(msg.get('from', 'unknown'), msg.get('text', ''))
             
             # File stream (8 or 9) - has its own error handling for binary chunks
             elif stream_category == 2:
@@ -469,24 +501,30 @@ class QuicPeerProtocol(QuicConnectionProtocol):
         """Handle file transfer data with length-prefix framing"""
         import struct
         
-        # Add incoming data to buffer
-        self._file_stream_buffer += data
-        
-        # Process complete frames from buffer
-        while len(self._file_stream_buffer) >= 4:
-            # Read length prefix
-            msg_len = struct.unpack('>I', self._file_stream_buffer[:4])[0]
+        if HAS_CPP_EXT:
+            self._file_framer.add_data(data)
+            frames = self._file_framer.get_frames()
+            for msg_data in frames:
+                self._process_file_message(msg_data)
+        else:
+            # Add incoming data to buffer
+            self._file_stream_buffer += data
             
-            # Check if we have the complete message
-            if len(self._file_stream_buffer) < 4 + msg_len:
-                break  # Wait for more data
-            
-            # Extract the message
-            msg_data = self._file_stream_buffer[4:4 + msg_len]
-            self._file_stream_buffer = self._file_stream_buffer[4 + msg_len:]
-            
-            # Process the message
-            self._process_file_message(msg_data)
+            # Process complete frames from buffer
+            while len(self._file_stream_buffer) >= 4:
+                # Read length prefix
+                msg_len = struct.unpack('>I', self._file_stream_buffer[:4])[0]
+                
+                # Check if we have the complete message
+                if len(self._file_stream_buffer) < 4 + msg_len:
+                    break  # Wait for more data
+                
+                # Extract the message
+                msg_data = self._file_stream_buffer[4:4 + msg_len]
+                self._file_stream_buffer = self._file_stream_buffer[4 + msg_len:]
+                
+                # Process the message
+                self._process_file_message(msg_data)
     
     def _process_file_message(self, data: bytes):
         """Process a single file transfer message"""

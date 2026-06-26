@@ -10,6 +10,7 @@ A minimal NAT traversal implementation using UDP hole punching with QUIC transpo
 - **Relay Fallback**: WebSocket-based relay when hole punching fails
 - **TLS Authentication**: QUIC built-in TLS 1.3 certificate-based authentication
 - **Metrics Dashboard**: Real-time metrics via HTTP endpoint
+- **High Performance C++ Core**: Native C++ extension (via `pybind11`) for UDP burst hole punching and QUIC stream framing to bypass Python's GIL and loop overhead.
 
 ## Architecture
 <p align="center">
@@ -22,19 +23,21 @@ A minimal NAT traversal implementation using UDP hole punching with QUIC transpo
 nat-traversal-udp-hole-punching-over-quic/
 ├── src/                   # Source code
 │   ├── peer/             # Peer node components
-│   │   ├── cli/          # Command-line interface logic
 │   │   ├── connection/   # QUIC, Relay, and Connection Manager
+│   │   ├── cpp_ext/      # C++ extension for performance critical operations
 │   │   ├── hole_punch/   # NAT detection and UDP hole punching
 │   │   ├── metrics/      # Metrics and HTTP server
 │   │   ├── signaling/    # Signaling client
 │   │   └── peer.py       # Main PeerNode orchestrator
 │   ├── server/           # Rendezvous server components
 │   │   └── rendezvous.py # STUN + Signaling logic
-│   └── common/           # Shared utilities (auth, etc.)
+|   └-─ common/           # Shared utilities (auth, etc.)
 ├── run_peer.py           # Top-level entry point for Peer
 ├── run_server.py         # Top-level entry point for Server
 ├── certs/                # TLS certificates (generated)
-├── scripts/              # Helper scripts (cert generation)
+├── scripts/ 
+|   ├─── gen_certs.py     # Helper scripts (cert generation)
+|   └─── cli.py           # Command-line interface logic
 ├── docker-compose.yml    # Docker configuration
 └── README.md
 ```
@@ -47,6 +50,7 @@ The `peer/` folder is organized into logical modules for better maintainability:
 |--------|---------|
 | `cli/` | Command-line interface and argument parsing |
 | `connection/` | Connection management, QUIC communication, and relay fallback |
+| `cpp_ext/` | Native C++ extension (via `pybind11`) for fast UDP packet blasting and QUIC stream framing |
 | `hole_punch/` | NAT detection and UDP hole punching implementation |
 | `signaling/` | Rendezvous server communication and peer discovery |
 | `metrics/` | Metrics collection and HTTP endpoint for monitoring |
@@ -64,6 +68,15 @@ This modular structure allows for:
 ```bash
 pip install -r requirements.txt
 python scripts/gen_certs.py
+```
+
+### Build the C++ Extension (Optional but recommended)
+
+For maximum performance during hole punching and file transfers, compile the native C++ extension:
+```bash
+cd src/peer/cpp_ext
+pip install -e .
+cd ../../..
 ```
 
 ### Start Rendezvous Server:

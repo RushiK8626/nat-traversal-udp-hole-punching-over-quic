@@ -1,4 +1,5 @@
 __pycache__/
+.pytest_cache/
 *.py[cod]
 *$py.class
 /*venv*
@@ -10,5 +11,4 @@ __pycache__/
 !README.md
 metrics.json
 demo*
-test*
 *.pkl

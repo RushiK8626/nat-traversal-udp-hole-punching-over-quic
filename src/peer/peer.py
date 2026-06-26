@@ -11,7 +11,7 @@ import socket
 import uuid
 import websockets
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 from peer.signaling.signaling import SignalingManager
 from peer.metrics.stats import StatManager
 from peer.connection.connection_manager import ConnectionManager
@@ -19,7 +19,7 @@ from peer.connection.connection_manager import ConnectionManager
 # Add parent directory to path to allow imports when running as script
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from peer.hole_punch.nat_classifier import NATClassifier, NATClassificationResult
+from peer.nat.nat_classifier import NATClassifier, NATClassificationResult
 from peer.connection.hole_punch import BidirectionalHolePuncher, HolePunchResult
 from peer.connection.quic_peer import QuicPeer, QuicPeerProtocol
 from peer.connection.relay import RelayClient, RelayPeerAdapter

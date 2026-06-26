@@ -14,6 +14,12 @@ from dataclasses import dataclass
 from typing import Optional, Tuple, Callable
 from concurrent.futures import ThreadPoolExecutor
 
+try:
+    from nat_core_ext import Puncher
+    HAS_CPP_EXT = True
+except ImportError:
+    HAS_CPP_EXT = False
+
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(name)s] [%(levelname)s] %(message)s')
 logger = logging.getLogger('hole_punch')
 
@@ -142,26 +148,56 @@ class HolePuncher:
     
     async def _send_punches(self, target_addr: Tuple[str, int], max_attempts: int):
         """Send punch packets at regular intervals"""
-        # Initial burst
-        logger.info(f"Sending initial burst to {target_addr}")
-        for i in range(5):
+        if HAS_CPP_EXT:
+            logger.info(f"Using C++ Puncher for burst to {target_addr}")
+            puncher = Puncher()
+            
+            # Since send_punches blocks (but releases GIL), run it in a thread
+            loop = asyncio.get_event_loop()
+            
+            # Set up a task to monitor and stop the puncher if we receive a response
+            async def monitor_puncher():
+                while not self._punch_received.is_set():
+                    await asyncio.sleep(0.05)
+                puncher.stop()
+            
+            monitor_task = asyncio.create_task(monitor_puncher())
+            
             try:
-                self.sock.sendto(self._create_punch_packet(i), target_addr)
+                await loop.run_in_executor(
+                    None,
+                    puncher.send_punches,
+                    self.sock.fileno(),
+                    target_addr[0],
+                    target_addr[1],
+                    self.peer_id,
+                    max_attempts
+                )
             except Exception as e:
-                logger.debug(f"Burst send error: {e}")
-            await asyncio.sleep(0.005)
+                logger.error(f"C++ Puncher error: {e}")
+            finally:
+                monitor_task.cancel()
+        else:
+            # Initial burst
+            logger.info(f"Sending initial burst to {target_addr}")
+            for i in range(5):
+                try:
+                    self.sock.sendto(self._create_punch_packet(i), target_addr)
+                except Exception as e:
+                    logger.debug(f"Burst send error: {e}")
+                await asyncio.sleep(0.005)
 
-        # Regular interval punches
-        for seq in range(5, max_attempts):
-            if self._punch_received.is_set():
-                break
-            try:
-                self.sock.sendto(self._create_punch_packet(seq), target_addr)
-                if seq % 10 == 0:
-                    logger.debug(f"Sent punch #{seq} to {target_addr}")
-            except Exception as e:
-                logger.error(f"Send error: {e}")
-            await asyncio.sleep(PUNCH_INTERVAL_MS / 1000)
+            # Regular interval punches
+            for seq in range(5, max_attempts):
+                if self._punch_received.is_set():
+                    break
+                try:
+                    self.sock.sendto(self._create_punch_packet(seq), target_addr)
+                    if seq % 10 == 0:
+                        logger.debug(f"Sent punch #{seq} to {target_addr}")
+                except Exception as e:
+                    logger.error(f"Send error: {e}")
+                await asyncio.sleep(PUNCH_INTERVAL_MS / 1000)
             
     async def _receive_punches(self, expected_addr: Tuple[str, int]):
         """Listen for incoming punch packets using asyncio reader or fallback to polling"""
